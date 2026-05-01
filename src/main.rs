@@ -73,6 +73,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()
                 match k.code {
                     KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                     KeyCode::Char('r') => app.reset_session(),
+                    KeyCode::Char('f') => app.toggle_footprint(),
                     _ => {}
                 }
             }

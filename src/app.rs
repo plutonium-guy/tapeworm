@@ -4,6 +4,7 @@ use rust_decimal::Decimal;
 
 use crate::delta::{self, DeltaTracker};
 use crate::feed::{FeedEvent, Trade};
+use crate::footprint::FootprintEngine;
 use crate::orderbook::{ApplyOutcome, OrderBook};
 
 /// Hard cap on the visible tape. Older trades are dropped.
@@ -30,6 +31,7 @@ pub struct AppState {
     pub symbol: String,
     pub book: OrderBook,
     pub delta: DeltaTracker,
+    pub footprint: FootprintEngine,
     pub tape: VecDeque<TapeEntry>,
     pub conn: ConnState,
     pub event_count: u64,
@@ -39,6 +41,8 @@ pub struct AppState {
     /// Track if any snapshot has ever been received (to suppress "stale"
     /// before first sync).
     pub has_snapshot: bool,
+    /// Whether the footprint panel is shown.
+    pub show_footprint: bool,
 }
 
 impl AppState {
@@ -47,12 +51,14 @@ impl AppState {
             symbol: symbol.into(),
             book: OrderBook::new(),
             delta: DeltaTracker::new(),
+            footprint: FootprintEngine::default(),
             tape: VecDeque::with_capacity(TAPE_CAP),
             conn: ConnState::Disconnected,
             event_count: 0,
             qty_window: VecDeque::with_capacity(SIZE_WINDOW),
             qty_window_sum: Decimal::ZERO,
             has_snapshot: false,
+            show_footprint: true,
         }
     }
 
@@ -92,6 +98,7 @@ impl AppState {
 
     fn record_trade(&mut self, trade: Trade) {
         self.delta.record(trade.side, trade.qty);
+        self.footprint.record(&trade);
         self.update_size_window(trade.qty);
         let large = self.is_large(trade.qty);
         self.tape.push_front(TapeEntry { trade, large });
@@ -125,6 +132,11 @@ impl AppState {
     /// Reset cumulative session counters. Tape & book left as-is.
     pub fn reset_session(&mut self) {
         self.delta.reset();
+        self.footprint.reset();
+    }
+
+    pub fn toggle_footprint(&mut self) {
+        self.show_footprint = !self.show_footprint;
     }
 
     pub fn aggressor_label(&self, side: delta::Side) -> &'static str {
@@ -209,6 +221,42 @@ mod tests {
         assert_eq!(app.delta.delta(), dec!(1));
         app.reset_session();
         assert_eq!(app.delta.delta(), Decimal::ZERO);
+        assert!(app.footprint.forming().is_none());
         assert_eq!(app.tape.len(), 2); // tape preserved
+    }
+
+    #[test]
+    fn footprint_totals_match_delta_totals_within_one_bar() {
+        let mut app = AppState::new("BTCUSDT");
+        // All trades within the same minute bar.
+        let trades: Vec<(Side, Decimal, Decimal)> = vec![
+            (Side::Buy, dec!(100.00), dec!(1.5)),
+            (Side::Sell, dec!(100.05), dec!(0.7)),
+            (Side::Buy, dec!(100.10), dec!(2.0)),
+            (Side::Sell, dec!(100.05), dec!(1.3)),
+            (Side::Buy, dec!(100.00), dec!(0.5)),
+        ];
+        for (side, price, qty) in trades {
+            app.handle(FeedEvent::Trade(Trade {
+                time_ms: 30_000,
+                price,
+                qty,
+                side,
+            }));
+        }
+        let bar = app.footprint.forming().unwrap();
+        assert_eq!(bar.total_buy, app.delta.buy_volume());
+        assert_eq!(bar.total_sell, app.delta.sell_volume());
+        assert_eq!(bar.delta(), app.delta.delta());
+    }
+
+    #[test]
+    fn toggle_flips_footprint_visibility() {
+        let mut app = AppState::new("BTCUSDT");
+        assert!(app.show_footprint);
+        app.toggle_footprint();
+        assert!(!app.show_footprint);
+        app.toggle_footprint();
+        assert!(app.show_footprint);
     }
 }

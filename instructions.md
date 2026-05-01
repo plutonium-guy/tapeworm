@@ -1,248 +1,256 @@
-# TAPEWORM — Agent Build Prompt
+# TAPEWORM — Phase 2 Agent Build Prompt
+## Footprint Chart
 
 ---
 
 ## OPERATING RULES
 
-You work in a strict loop. Every step must be verified before
-moving to the next one.
+Same as Phase 1. You work in a strict loop.
 
 Plan what you will build. Build it. Run it. Verify it works.
 Fix any errors. Only then move to the next step.
 
-Never write code across multiple components before verifying
-the first one compiles. Never assume something works without
+Never write across multiple components before verifying the
+first one compiles. Never assume something works without
 running it. If something fails three times, stop and explain
 what is blocking you.
 
----
-
-## WHAT IS TAPEWORM
-
-Tapeworm is a real-time order flow terminal that runs in the
-terminal (TUI). It is written in Rust.
-
-It connects to a live market data feed, processes the raw
-data stream into meaningful order flow signals, and displays
-everything in a terminal UI that updates in real time.
-
-The name comes from the reconstructed tape — the continuous
-stream of every trade that executes in the market, revealing
-whether buyers or sellers are in control moment to moment.
-
-The product is inspired by Jigsaw Trading, a professional
-order flow analysis tool used by futures day traders. Tapeworm
-is the core of what Jigsaw does, without broker execution.
+Phase 1 is already complete. The application has a working
+DOM ladder, reconstructed tape, and delta panel fed by a live
+Binance WebSocket. Do not modify any Phase 1 behaviour.
+Phase 2 adds the footprint chart as a new panel. Everything
+built in Phase 1 continues to work unchanged.
 
 ---
 
-## DATA SOURCE
+## WHAT IS A FOOTPRINT CHART
 
-Use the Binance public WebSocket API. It is completely free,
-requires no API key, no account and no agreements. It provides
-two streams that Tapeworm needs: a depth of market stream and
-a trade stream. Subscribe to both simultaneously over a single
-connection. Use BTCUSDT as the default symbol.
+A footprint chart is the most information-dense visualization
+in order flow trading. It combines everything a standard
+candlestick chart shows with the full breakdown of buying and
+selling activity at every single price level within each bar.
 
----
+A standard candlestick tells you open, high, low, close and
+total volume for a time period. A footprint chart tells you
+all of that plus, for every price level the market visited
+inside that bar, exactly how much volume traded as a buyer
+aggressor and how much traded as a seller aggressor.
 
-## HOW THE MARKET DATA WORKS
+This means a trader can see not just that a candle moved up,
+but which price levels had strong buying, which had strong
+selling, and where the balance shifted. It turns a single bar
+into a complete story of the auction that happened inside it.
 
-The market produces two continuous data streams.
-
-The first is the order book. At any moment the market has
-thousands of resting limit orders at different prices. Buyers
-place bids below the current price. Sellers place asks above
-it. The collection of all these resting orders at every price
-level is the order book. It changes constantly as orders are
-added, modified and cancelled. Tapeworm must maintain a
-correct and current snapshot of this in memory at all times.
-
-The second is the trade feed. Every time a buyer and seller
-match, a trade executes. Each trade has a price, a quantity,
-and an aggressor side — either a buyer who hit an ask, or a
-seller who hit a bid. Tapeworm consumes every trade and uses
-it to track buying and selling pressure.
+Jigsaw Trading calls this Auction Vista. In the wider industry
+it is known as a footprint chart, bid/ask footprint, or
+order flow chart. It is the feature that most separates
+professional order flow tools from standard charting software.
 
 ---
 
-## CORE CONCEPTS TO IMPLEMENT
+## HOW A FOOTPRINT CHART IS BUILT
 
-### Order Book State
+### The raw material
 
-The order book is the central data structure. It has two sides:
-bids sorted by price descending and asks sorted by price
-ascending. The application must maintain this state correctly
-by applying every incoming update from the feed.
+Everything needed to build footprint charts already exists in
+the Phase 1 trade feed. No new data source is required. Every
+trade that arrives has a price, a quantity, and a side
+(buyer-initiated or seller-initiated). The footprint engine
+simply organizes these trades into time buckets and price
+buckets simultaneously.
 
-The most important correctness rule is that the book can fall
-out of sync if a message is missed. When that happens the book
-must be marked as stale and the display must reflect this
-rather than showing incorrect data.
+### The two dimensions
 
-Prices must be handled with exact precision internally.
-Floating point arithmetic is not reliable for equality checks
-and map lookups. The implementation must account for this.
+Time dimension — each bar covers a fixed time period.
+Start with one minute bars. Each bar has a start time and
+an end time. When the period ends, the bar is closed and
+a new one begins.
 
-### Delta
+Price dimension — within each bar, every price level that
+saw any trading activity gets its own row. The price
+granularity matches the tick size of the instrument.
 
-Delta is the difference between buy-initiated volume and
-sell-initiated volume over the current session.
+### What each cell contains
 
-Every trade is either buyer-initiated (a buyer hit the ask)
-or seller-initiated (a seller hit the bid). By tracking these
-separately and computing the running difference, delta reveals
-whether buying or selling pressure is dominant right now.
+At the intersection of a bar and a price level there are
+two numbers: the volume that traded as buyer-initiated at
+that price, and the volume that traded as seller-initiated
+at that price. These are written as a pair, conventionally
+shown as sell volume on the left and buy volume on the right.
 
-Positive delta means buyers are more aggressive.
-Negative delta means sellers are more aggressive.
+### What gets computed per bar
 
-The feed provides enough information to classify every trade
-as buyer or seller initiated. Use it correctly.
+For each completed or in-progress bar, compute:
 
-### Reconstructed Tape
+The open price — the first trade price in the bar.
+The close price — the most recent trade price in the bar.
+The high price — the highest price any trade occurred at.
+The low price — the lowest price any trade occurred at.
+Total buy volume — sum of all buyer-initiated trade volume.
+Total sell volume — sum of all seller-initiated trade volume.
+Total delta — buy volume minus sell volume for the whole bar.
+Point of control — the price level with the highest total
+volume (buy plus sell combined) within the bar.
 
-The tape is the chronological stream of every trade, each one
-labelled as a buy or a sell. It is called reconstructed
-because classifying each trade by aggressor side requires
-interpretation of the raw feed data — it is not directly
-labelled in most feeds.
+### The imbalance signal
 
-A large trade is one that is significantly bigger than typical.
-These deserve visual distinction in the tape because they often
-indicate institutional activity.
+At each price level within a bar, compare the buy volume to
+the sell volume. When one side is significantly larger than
+the other — for example three times larger or more — this is
+called an imbalance. Imbalances are visually highlighted
+because they indicate one side overwhelmed the other at a
+specific price, which often acts as a magnet for future price
+activity or a barrier to movement.
 
 ---
 
 ## FEATURES TO BUILD
 
-### Feature 1 — DOM Price Ladder
+### Feature 1 — Footprint Engine
 
-Display the live depth of market as a vertical price ladder.
+Build a new engine that ingests the same trade events that
+the delta engine already receives. This engine organizes
+trades into a rolling window of time bars.
 
-Show the top price levels on both sides of the book. Asks
-appear above the current price in red. Bids appear below in
-green. The spread between best bid and best ask is shown as a
-separator between the two sides.
+Each bar accumulates volume at every price level it visits.
+When a bar's time period expires it is sealed as complete
+and a new bar begins. Maintain a rolling history of the
+last twenty completed bars plus the current forming bar.
 
-Each price level shows the quantity available. A horizontal
-bar proportional to that quantity gives an instant visual
-sense of where size is concentrated relative to other levels.
-The longest bar corresponds to the largest quantity visible.
+The engine must correctly handle the transition between bars.
+A trade whose timestamp falls in the next period must not
+contaminate the previous bar.
 
-The best bid and best ask rows are visually emphasized.
+### Feature 2 — Footprint Chart Panel
 
-When the book is stale or disconnected the panel must clearly
-show this status instead of displaying potentially incorrect
-price levels.
+Add a new panel to the TUI that displays the footprint chart.
+This panel shows the most recent bars side by side, with the
+current forming bar on the right and completed bars to its
+left, scrolling leftward as new bars complete.
 
-### Feature 2 — Reconstructed Tape
+Each bar is rendered as a vertical column. Within each column,
+every price level that saw trading activity shows the sell
+volume and buy volume as a pair of numbers side by side.
+Price levels are aligned vertically across bars so the same
+price always appears at the same vertical position.
 
-Display a scrolling list of every trade as it happens.
+The current price level (where the last trade occurred) is
+visually highlighted so the trader always knows where the
+market is within the footprint.
 
-Each entry shows the time it occurred, the price, the
-quantity, and whether it was a buy or a sell. Buys are green
-with an upward indicator. Sells are red with a downward
-indicator.
+### Feature 3 — Visual Encoding
 
-The most recent trade always appears at the top. Older trades
-scroll down and eventually fall off.
+Buy-heavy levels show in green. Sell-heavy levels show in red.
+Balanced levels show in the default color.
 
-Large trades are visually distinguished from normal trades
-so the trader's eye is drawn to them immediately.
+Imbalanced levels — where one side is three times or more
+larger than the other — are shown in a brighter or bolder
+style to draw the eye immediately.
 
-### Feature 3 — Delta Panel
+The point of control for each bar is visually distinguished.
+It is the most important level in the bar and should be
+immediately identifiable.
 
-Display a summary of cumulative order flow for the session.
+The current forming bar looks visually different from
+completed bars. Completed bars are static. The forming bar
+updates with every new trade.
 
-Show the total buy volume, total sell volume, total combined
-volume, and the net delta (buy minus sell). The delta number
-is green when positive and red when negative.
+### Feature 4 — Bar Summary Row
 
-Show a visual ratio bar that represents the proportion of
-buying versus selling activity. The bar fills proportionally
-with buy volume on one side and sell volume on the other,
-making it immediately obvious which side has been dominant.
+At the top or bottom of each bar column, show a compact
+summary: the total delta for that bar (positive in green,
+negative in red) and the total volume. This gives a quick
+read of each bar's character without needing to read every
+level.
 
-### Feature 4 — Status Bar
+### Feature 5 — Time Scale
 
-A single line at the bottom of the terminal showing the
-application name, the current symbol, the current spread,
-the total number of market events received since launch,
-and keyboard shortcut reminders.
+Show a time label at the bottom of each completed bar
+indicating when that bar closed. The current forming bar
+shows how much time remains until it closes, counting down
+in seconds.
 
-### Feature 5 — Keyboard Controls
+### Feature 6 — Layout Integration
 
-q or Escape — exit the application cleanly and restore
-the terminal to its original state.
+The footprint chart panel takes the full width of the
+terminal below the existing three panels from Phase 1, or
+replaces one of them if the terminal is too narrow to fit
+four panels comfortably. The Phase 1 panels must remain
+fully functional regardless of layout choice.
 
-r — reset the delta counters to zero for a fresh session
-without restarting the application.
-
-### Feature 6 — Automatic Reconnection
-
-If the connection to the feed drops for any reason the
-application must attempt to reconnect automatically after
-a short delay. The user should never need to restart the
-binary. The status bar must reflect the connection state.
+Add a keyboard shortcut to toggle the footprint panel
+visibility on and off so the user can choose between the
+compact three-panel view from Phase 1 and the expanded
+view with the footprint chart.
 
 ---
 
-## QUALITY REQUIREMENTS
+## CORRECTNESS REQUIREMENTS
 
-The UI must update smoothly at approximately 60 frames per
-second. The market data feed runs on its own background task.
-The UI rendering runs on its own cadence. They must not block
-each other under any circumstances.
+Bars must close on clean time boundaries. A one-minute bar
+must close at exactly the start of the next minute, not one
+minute after the first trade arrived. Use wall clock time
+aligned to the minute, not elapsed time since start.
 
-All internal buffers must have a maximum size. The tape, the
-delta history, and any other rolling buffers must not grow
-without bound. When they are full, old entries are dropped.
+Volume totals in the footprint must match the delta engine
+totals exactly. If the delta engine says buy volume is X for
+a given bar period, the footprint engine must show X when
+that bar's levels are summed. They draw from the same raw
+trades and must agree.
 
-The application must never corrupt the terminal on exit or
-crash. Even in the event of a panic, the terminal must be
-restored to its normal state.
-
-Unit tests must be written for the order book state logic
-and the delta calculation logic. These are the two most
-critical pieces of correctness in the entire application.
+Price levels within a bar must be sorted so that higher
+prices appear higher on screen. The vertical alignment of
+prices must be consistent across all visible bars so a
+horizontal read across bars at the same vertical position
+always represents the same price.
 
 ---
 
 ## BUILD ORDER
 
-Build in this sequence. Do not proceed to the next phase
-until the current phase is verified working.
+Build in this sequence. Verify each phase before proceeding.
 
-Phase 1 — Order book engine with unit tests passing
-Phase 2 — Delta engine with unit tests passing
-Phase 3 — Feed adapter connecting to Binance and receiving live data
-Phase 4 — Wire all three together into a single app state
-Phase 5 — Build the TUI and render all panels with live data
-Phase 6 — Polish: status bar, reconnection, edge cases
+Phase 2a — Footprint engine with unit tests. Tests must
+verify that trades are bucketed into the correct bar, that
+bar transitions work correctly, that volume totals are
+accurate, and that point of control is identified correctly.
+
+Phase 2b — Wire the footprint engine into the existing app
+state alongside the delta engine. Both engines receive the
+same trade events. Verify with a test that after a set of
+known trades the footprint state matches expectations.
+
+Phase 2c — Build the footprint chart panel and integrate
+it into the TUI layout. Start by rendering completed bars
+correctly before worrying about the forming bar animation.
+
+Phase 2d — Add the forming bar live updates, the countdown
+timer, the imbalance highlighting, and the keyboard toggle.
 
 ---
 
-## OUT OF SCOPE
+## OUT OF SCOPE FOR THIS PHASE
 
-Do not build any of the following. They are future work:
-
-Real broker connectivity or order execution of any kind.
-Iceberg order detection. Absorption detection. Footprint
-charts. Trade journaling or analytics. Historical data replay.
-Any database. Multi-symbol view. Configuration files or CLI
-arguments. Alerts or notifications.
+Variable bar sizes (tick bars, volume bars, range bars).
+Zoom or scroll through historical bars beyond the rolling
+twenty bar window. Saving or exporting footprint data.
+Any kind of pattern detection or alerting on footprint
+structure. Mouse interaction.
 
 ---
 
 ## DEFINITION OF DONE
 
-All unit tests pass with zero failures.
-The binary connects to Binance and shows live data within
-three seconds of launch.
-All three panels update correctly with real market data.
-Large trades are visually distinguished in the tape.
-Pressing q restores the terminal completely.
-Network disconnect and reconnect is handled without crashing.
-The application runs stably for ten minutes without panic
-or visible memory growth.
+Unit tests for the footprint engine pass with zero failures.
+Volume totals in the footprint match the delta engine exactly
+for the same time period.
+Completed bars render correctly with buy and sell volumes
+at each price level.
+The forming bar updates in real time with each new trade.
+Imbalanced levels are visually distinct from balanced ones.
+The point of control is clearly identifiable in each bar.
+Bar boundaries fall on clean clock minute boundaries.
+The keyboard toggle shows and hides the footprint panel.
+All Phase 1 features continue to work without any regression.
+The application runs stably for ten minutes with the
+footprint panel active and no memory growth.

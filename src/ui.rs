@@ -10,14 +10,28 @@ use time::macros::format_description;
 
 use crate::app::{AppState, ConnState};
 use crate::delta::Side;
+use crate::footprint::{FootprintBar, Imbalance};
 
 const TIME_FMT: &[FormatItem<'_>] = format_description!("[hour]:[minute]:[second]");
+const HHMM_FMT: &[FormatItem<'_>] = format_description!("[hour]:[minute]");
 
 pub fn draw(frame: &mut Frame, app: &AppState) {
     let area = frame.area();
+    let now_ms = current_unix_ms();
+
+    let constraints: Vec<Constraint> = if app.show_footprint && area.height > 18 {
+        let fp_h = ((area.height as i32 - 1) / 2).clamp(10, 24) as u16;
+        vec![
+            Constraint::Min(8),
+            Constraint::Length(fp_h),
+            Constraint::Length(1),
+        ]
+    } else {
+        vec![Constraint::Min(0), Constraint::Length(1)]
+    };
     let outer = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .constraints(constraints.clone())
         .split(area);
 
     let cols = Layout::default()
@@ -32,7 +46,18 @@ pub fn draw(frame: &mut Frame, app: &AppState) {
     draw_dom(frame, cols[0], app);
     draw_tape(frame, cols[1], app);
     draw_delta(frame, cols[2], app);
-    draw_status(frame, outer[1], app);
+
+    if constraints.len() == 3 {
+        draw_footprint(frame, outer[1], app, now_ms);
+        draw_status(frame, outer[2], app);
+    } else {
+        draw_status(frame, outer[1], app);
+    }
+}
+
+fn current_unix_ms() -> i64 {
+    let now = OffsetDateTime::now_utc();
+    now.unix_timestamp() * 1000 + (now.nanosecond() as i64) / 1_000_000
 }
 
 fn draw_dom(frame: &mut Frame, area: Rect, app: &AppState) {
@@ -252,7 +277,7 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &AppState) {
         Span::raw(format!("  evt {}", app.event_count)),
         Span::raw("  "),
         stale,
-        Span::raw("  [q] quit  [r] reset"),
+        Span::raw("  [q] quit  [r] reset  [f] footprint"),
     ]);
     frame.render_widget(Paragraph::new(line), area);
 }
@@ -263,4 +288,227 @@ fn fmt_price(p: Decimal) -> String {
 
 fn fmt_qty(q: Decimal) -> String {
     q.round_dp(4).to_string()
+}
+
+const FP_BAR_WIDTH: u16 = 13;
+const FP_PRICE_COL: u16 = 9;
+
+fn draw_footprint(frame: &mut Frame, area: Rect, app: &AppState, now_ms: i64) {
+    let block = Block::default().borders(Borders::ALL).title("Footprint");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.width <= FP_PRICE_COL + FP_BAR_WIDTH || inner.height < 6 {
+        let p = Paragraph::new("terminal too small for footprint").style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(p, inner);
+        return;
+    }
+
+    let avail_for_bars = inner.width.saturating_sub(FP_PRICE_COL);
+    let max_bars = (avail_for_bars / FP_BAR_WIDTH) as usize;
+    if max_bars == 0 {
+        return;
+    }
+
+    // Newest bars on the right; collect chronologically and keep the last `max_bars`.
+    let mut visible: Vec<&FootprintBar> = app
+        .footprint
+        .completed()
+        .iter()
+        .chain(app.footprint.forming().into_iter())
+        .collect();
+    if visible.len() > max_bars {
+        let drop = visible.len() - max_bars;
+        visible.drain(..drop);
+    }
+
+    if visible.is_empty() {
+        let p = Paragraph::new("waiting for first trade…").style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(p, inner);
+        return;
+    }
+
+    // Header rows: time, vol, delta. Then body of price levels. Reserve 3 header rows.
+    let header_rows: u16 = 3;
+    if inner.height <= header_rows + 1 {
+        return;
+    }
+    let body_rows = inner.height - header_rows;
+
+    // Aligned price set across visible bars.
+    let mut price_set = std::collections::BTreeSet::new();
+    for &bar in &visible {
+        for price in bar.levels.keys() {
+            price_set.insert(*price);
+        }
+    }
+    let mut prices: Vec<Decimal> = price_set.into_iter().collect();
+    prices.sort_by(|a: &Decimal, b: &Decimal| b.cmp(a)); // descending
+
+    // If too many prices, center the window around the latest forming bar's close.
+    if prices.len() > body_rows as usize {
+        let pivot = visible.last().unwrap().close;
+        let pivot_tick = round_to_tick_loose(pivot, app.footprint.tick());
+        let pivot_idx = prices
+            .iter()
+            .position(|p| *p <= pivot_tick)
+            .unwrap_or(prices.len() / 2);
+        let half = body_rows as usize / 2;
+        let start = pivot_idx.saturating_sub(half);
+        let end = (start + body_rows as usize).min(prices.len());
+        let start = end.saturating_sub(body_rows as usize);
+        prices = prices[start..end].to_vec();
+    }
+
+    // Forming bar = last visible if its end > now_ms.
+    let forming_start = app
+        .footprint
+        .forming()
+        .map(|b| b.start_ms);
+
+    let mut lines: Vec<Line> = Vec::with_capacity(inner.height as usize);
+
+    // Row 1: time / countdown
+    let mut spans: Vec<Span> = Vec::new();
+    spans.push(Span::raw(format!("{:>width$}", "", width = FP_PRICE_COL as usize)));
+    for &bar in &visible {
+        let label = if Some(bar.start_ms) == forming_start {
+            let secs = ((bar.end_ms - now_ms).max(0)) / 1000;
+            format!("T-{secs:>3}s")
+        } else {
+            let dt = OffsetDateTime::from_unix_timestamp(bar.end_ms / 1000)
+                .unwrap_or(OffsetDateTime::UNIX_EPOCH);
+            dt.format(HHMM_FMT).unwrap_or_else(|_| "--:--".into())
+        };
+        spans.push(bar_cell_span(&format!(" {:^11} ", label), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+    }
+    lines.push(Line::from(spans));
+
+    // Row 2: total volume
+    let mut spans: Vec<Span> = Vec::new();
+    spans.push(Span::raw(format!("{:>width$}", "vol", width = FP_PRICE_COL as usize)));
+    for &bar in &visible {
+        let v = fmt_qty_compact(bar.total_volume());
+        spans.push(bar_cell_span(&format!(" {v:^11} "), Style::default().fg(Color::Gray)));
+    }
+    lines.push(Line::from(spans));
+
+    // Row 3: delta
+    let mut spans: Vec<Span> = Vec::new();
+    spans.push(Span::raw(format!("{:>width$}", "Δ", width = FP_PRICE_COL as usize)));
+    for &bar in &visible {
+        let d = bar.delta();
+        let color = if d.is_sign_negative() {
+            Color::Red
+        } else if d.is_zero() {
+            Color::Gray
+        } else {
+            Color::Green
+        };
+        let s = fmt_qty_compact(d);
+        spans.push(bar_cell_span(
+            &format!(" {s:^11} "),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ));
+    }
+    lines.push(Line::from(spans));
+
+    // Body rows: one per visible price level.
+    let last_close = visible.last().map(|b| b.close);
+    let last_close_tick = last_close.map(|p| round_to_tick_loose(p, app.footprint.tick()));
+
+    for price in prices {
+        let mut spans: Vec<Span> = Vec::new();
+        let price_str = fmt_price(price);
+        let mut price_style = Style::default().fg(Color::White);
+        if Some(price) == last_close_tick {
+            price_style = price_style.add_modifier(Modifier::BOLD).fg(Color::Yellow);
+        }
+        spans.push(Span::styled(
+            format!("{price_str:>width$}", width = FP_PRICE_COL as usize),
+            price_style,
+        ));
+        for &bar in &visible {
+            let cell = bar.levels.get(&price).copied().unwrap_or_default();
+            let is_poc = bar.point_of_control() == Some(price);
+            spans.push(footprint_cell_span(cell, is_poc));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn footprint_cell_span(cell: crate::footprint::Cell, is_poc: bool) -> Span<'static> {
+    let imb = cell.imbalance();
+    let net = cell.buy.cmp(&cell.sell);
+
+    let base_color = if cell.total().is_zero() {
+        Color::DarkGray
+    } else {
+        match imb {
+            Imbalance::Buy => Color::Green,
+            Imbalance::Sell => Color::Red,
+            Imbalance::Balanced => match net {
+                std::cmp::Ordering::Greater => Color::LightGreen,
+                std::cmp::Ordering::Less => Color::LightRed,
+                std::cmp::Ordering::Equal => Color::Gray,
+            },
+        }
+    };
+
+    let mut style = Style::default().fg(base_color);
+    if matches!(imb, Imbalance::Buy | Imbalance::Sell) {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    if is_poc {
+        style = style.add_modifier(Modifier::REVERSED);
+    }
+
+    let text = if cell.total().is_zero() {
+        format!(" {:>4}|{:<4} ", "·", "·")
+    } else {
+        format!(" {:>4}|{:<4} ", fmt_cell_qty(cell.sell), fmt_cell_qty(cell.buy))
+    };
+    Span::styled(text, style)
+}
+
+fn bar_cell_span(text: &str, style: Style) -> Span<'static> {
+    Span::styled(text.to_string(), style)
+}
+
+/// Compact qty for headers: e.g. "12.34" or "1.2k".
+fn fmt_qty_compact(q: Decimal) -> String {
+    let neg = q.is_sign_negative();
+    let abs = if neg { -q } else { q };
+    let f: f64 = abs.try_into().unwrap_or(0.0);
+    let s = if f >= 1000.0 {
+        format!("{:.1}k", f / 1000.0)
+    } else if f >= 100.0 {
+        format!("{f:.1}")
+    } else {
+        format!("{f:.2}")
+    };
+    if neg { format!("-{s}") } else { s }
+}
+
+fn fmt_cell_qty(q: Decimal) -> String {
+    let f: f64 = q.try_into().unwrap_or(0.0);
+    if f >= 1000.0 {
+        format!("{:.1}k", f / 1000.0)
+    } else if f >= 100.0 {
+        format!("{f:.0}")
+    } else if f >= 10.0 {
+        format!("{f:.1}")
+    } else {
+        format!("{f:.2}")
+    }
+}
+
+fn round_to_tick_loose(price: Decimal, tick: Decimal) -> Decimal {
+    if tick.is_zero() {
+        return price;
+    }
+    let n = price / tick;
+    n.round() * tick
 }
