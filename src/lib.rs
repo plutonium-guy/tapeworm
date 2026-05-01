@@ -1,6 +1,9 @@
 pub mod app;
+pub mod candle;
+pub mod chart;
 pub mod delta;
 pub mod feed;
 pub mod footprint;
+pub mod indicators;
 pub mod orderbook;
 pub mod ui;

@@ -2,6 +2,8 @@ use std::collections::VecDeque;
 
 use rust_decimal::Decimal;
 
+use crate::candle::CandleEngine;
+use crate::chart::ChartView;
 use crate::delta::{self, DeltaTracker};
 use crate::feed::{FeedEvent, Trade};
 use crate::footprint::FootprintEngine;
@@ -32,6 +34,8 @@ pub struct AppState {
     pub book: OrderBook,
     pub delta: DeltaTracker,
     pub footprint: FootprintEngine,
+    pub candles: CandleEngine,
+    pub chart: ChartView,
     pub tape: VecDeque<TapeEntry>,
     pub conn: ConnState,
     pub event_count: u64,
@@ -43,6 +47,13 @@ pub struct AppState {
     pub has_snapshot: bool,
     /// Whether the footprint panel is shown.
     pub show_footprint: bool,
+    /// Whether the candle chart panel is shown (mutually exclusive with footprint).
+    pub show_chart: bool,
+    /// Last alert price that was just crossed; used to drive a flash in the
+    /// status bar. None when not flashing.
+    pub alert_flash_until_ms: Option<i64>,
+    /// Latest price seen so we can detect alert crosses.
+    last_seen_price: Option<f64>,
 }
 
 impl AppState {
@@ -52,6 +63,8 @@ impl AppState {
             book: OrderBook::new(),
             delta: DeltaTracker::new(),
             footprint: FootprintEngine::default(),
+            candles: CandleEngine::default(),
+            chart: ChartView::default(),
             tape: VecDeque::with_capacity(TAPE_CAP),
             conn: ConnState::Disconnected,
             event_count: 0,
@@ -59,6 +72,9 @@ impl AppState {
             qty_window_sum: Decimal::ZERO,
             has_snapshot: false,
             show_footprint: true,
+            show_chart: false,
+            alert_flash_until_ms: None,
+            last_seen_price: None,
         }
     }
 
@@ -99,6 +115,21 @@ impl AppState {
     fn record_trade(&mut self, trade: Trade) {
         self.delta.record(trade.side, trade.qty);
         self.footprint.record(&trade);
+        self.candles.record(&trade);
+        // Detect alert crossing (price moved across any alert level since
+        // the previous trade). Set a 1.5-second flash window.
+        let price_f: f64 = trade.price.try_into().unwrap_or(0.0);
+        if let Some(prev) = self.last_seen_price {
+            for &alert in &self.chart.alerts {
+                let crossed_up = prev < alert && price_f >= alert;
+                let crossed_dn = prev > alert && price_f <= alert;
+                if crossed_up || crossed_dn {
+                    self.alert_flash_until_ms = Some(trade.time_ms + 1500);
+                    break;
+                }
+            }
+        }
+        self.last_seen_price = Some(price_f);
         self.update_size_window(trade.qty);
         let large = self.is_large(trade.qty);
         self.tape.push_front(TapeEntry { trade, large });
@@ -133,10 +164,29 @@ impl AppState {
     pub fn reset_session(&mut self) {
         self.delta.reset();
         self.footprint.reset();
+        self.candles.reset_all();
     }
 
     pub fn toggle_footprint(&mut self) {
         self.show_footprint = !self.show_footprint;
+        if self.show_footprint {
+            self.show_chart = false;
+        }
+    }
+
+    pub fn toggle_chart(&mut self) {
+        self.show_chart = !self.show_chart;
+        if self.show_chart {
+            self.show_footprint = false;
+        }
+    }
+
+    /// Returns the latest known close from the candle engine, if any.
+    pub fn last_chart_price(&self) -> Option<f64> {
+        if let Some(b) = self.candles.forming() {
+            return Some(b.close);
+        }
+        self.candles.completed().back().map(|b| b.close)
     }
 
     pub fn aggressor_label(&self, side: delta::Side) -> &'static str {

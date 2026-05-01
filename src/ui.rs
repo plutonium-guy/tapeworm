@@ -19,11 +19,12 @@ pub fn draw(frame: &mut Frame, app: &AppState) {
     let area = frame.area();
     let now_ms = current_unix_ms();
 
-    let constraints: Vec<Constraint> = if app.show_footprint && area.height > 18 {
-        let fp_h = ((area.height as i32 - 1) / 2).clamp(10, 24) as u16;
+    let lower_active = (app.show_footprint || app.show_chart) && area.height > 18;
+    let constraints: Vec<Constraint> = if lower_active {
+        let lower_h = ((area.height as i32 - 1) / 2).clamp(12, 30) as u16;
         vec![
             Constraint::Min(8),
-            Constraint::Length(fp_h),
+            Constraint::Length(lower_h),
             Constraint::Length(1),
         ]
     } else {
@@ -48,7 +49,11 @@ pub fn draw(frame: &mut Frame, app: &AppState) {
     draw_delta(frame, cols[2], app);
 
     if constraints.len() == 3 {
-        draw_footprint(frame, outer[1], app, now_ms);
+        if app.show_chart {
+            crate::chart::draw(frame, outer[1], app);
+        } else {
+            draw_footprint(frame, outer[1], app, now_ms);
+        }
         draw_status(frame, outer[2], app);
     } else {
         draw_status(frame, outer[1], app);
@@ -266,6 +271,17 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &AppState) {
     } else {
         Span::raw("")
     };
+    let now_ms = current_unix_ms();
+    let alert_flash = match app.alert_flash_until_ms {
+        Some(t) if now_ms < t => Span::styled(
+            " ALERT ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::LightRed)
+                .add_modifier(Modifier::BOLD | Modifier::SLOW_BLINK),
+        ),
+        _ => Span::raw(""),
+    };
     let line = Line::from(vec![
         Span::styled(
             "TAPEWORM ",
@@ -277,7 +293,9 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &AppState) {
         Span::raw(format!("  evt {}", app.event_count)),
         Span::raw("  "),
         stale,
-        Span::raw("  [q] quit  [r] reset  [f] footprint"),
+        Span::raw(" "),
+        alert_flash,
+        Span::raw("  [q]quit [r]reset [f]fp [c]chart [1-5]tf [t]type [v]vol [i]ind [x]cross"),
     ]);
     frame.render_widget(Paragraph::new(line), area);
 }

@@ -74,6 +74,32 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()
                     KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                     KeyCode::Char('r') => app.reset_session(),
                     KeyCode::Char('f') => app.toggle_footprint(),
+                    KeyCode::Char('c') => app.toggle_chart(),
+                    KeyCode::Char('1') => app.chart.set_timeframe_index(0),
+                    KeyCode::Char('2') => app.chart.set_timeframe_index(1),
+                    KeyCode::Char('3') => app.chart.set_timeframe_index(2),
+                    KeyCode::Char('4') => app.chart.set_timeframe_index(3),
+                    KeyCode::Char('5') => app.chart.set_timeframe_index(4),
+                    KeyCode::Char('t') => app.chart.cycle_candle_type(),
+                    KeyCode::Char('v') => app.chart.cycle_volume_mode(),
+                    KeyCode::Char('i') => app.chart.cycle_indicator(),
+                    KeyCode::Char('V') => app.chart.toggle_vwap(),
+                    KeyCode::Char('P') => app.chart.toggle_volume_profile(),
+                    KeyCode::Char('D') => app.chart.toggle_cum_delta(),
+                    KeyCode::Char('I') => app.chart.toggle_indicator_panel(),
+                    KeyCode::Char('9') => app.chart.toggle_ema(0),
+                    KeyCode::Char('0') => app.chart.toggle_ema(1),
+                    KeyCode::Char('-') => app.chart.toggle_ema(2),
+                    KeyCode::Char('a') => {
+                        if let Some(p) = app.last_chart_price() { app.chart.add_alert(p); }
+                    }
+                    KeyCode::Delete | KeyCode::Char('A') => {
+                        if let Some(p) = app.last_chart_price() { app.chart.remove_nearest_alert(p); }
+                    }
+                    KeyCode::Char('x') => app.chart.toggle_crosshair(),
+                    KeyCode::Left => app.chart.scroll_left(1),
+                    KeyCode::Right => app.chart.scroll_right(1),
+                    KeyCode::Home => app.chart.scroll_home(),
                     _ => {}
                 }
             }
