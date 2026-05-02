@@ -49,6 +49,12 @@ async fn main() -> Result<()> {
 
 async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
     let mut app = AppState::new(SYMBOL);
+    // Best-effort: pick up previously-trained RL weights if present so the
+    // agent isn't a blank slate every launch. Failure (file missing or
+    // parse error) is silent — the agent stays freshly initialised.
+    if let Err(e) = app.rl_load() {
+        tracing::debug!(error = ?e, "no rl-weights.txt to load (fresh agent)");
+    }
     // Tagged channel: (symbol, FeedEvent) — one full feed per symbol so
     // every watched symbol's heavy engines run concurrently.
     let (tx, mut rx) = mpsc::channel::<(String, feed::FeedEvent)>(8192);
@@ -124,6 +130,10 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()
                     KeyCode::Char('z') => app.toggle_analytics(),
                     KeyCode::Char('w') => app.toggle_watchlist(),
                     KeyCode::Char('G') => app.toggle_graphs(),
+                    KeyCode::Char('M') => app.toggle_rl_panel(),
+                    KeyCode::Char('N') => app.toggle_rl_enabled(),
+                    KeyCode::Char('Y') => app.toggle_rl_training(),
+                    KeyCode::Char('Z') => app.toggle_rl_auto_trade(),
                     KeyCode::Char(']') if app.show_graphs => app.cycle_graphs_page(),
                     KeyCode::Tab => {
                         // Cycle to the next watched symbol.

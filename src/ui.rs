@@ -43,7 +43,7 @@ pub fn draw(frame: &mut Frame, app: &AppState) {
     let area = frame.area();
     let now_ms = current_unix_ms();
 
-    let lower_active = (app.show_footprint || app.show_chart || app.show_analytics || app.show_watchlist || app.show_graphs) && area.height > 18;
+    let lower_active = (app.show_footprint || app.show_chart || app.show_analytics || app.show_watchlist || app.show_graphs || app.show_rl) && area.height > 18;
     let constraints: Vec<Constraint> = if lower_active {
         let lower_h = ((area.height as i32 - 1) / 2).clamp(12, 30) as u16;
         vec![
@@ -93,7 +93,9 @@ pub fn draw(frame: &mut Frame, app: &AppState) {
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Min(30), Constraint::Length(40)])
                 .split(outer[1]);
-            if app.show_graphs {
+            if app.show_rl {
+                draw_rl(frame, split[0], app);
+            } else if app.show_graphs {
                 crate::graphs::draw_graphs_panel(frame, split[0], app);
             } else if app.show_watchlist {
                 draw_watchlist(frame, split[0], app);
@@ -105,6 +107,8 @@ pub fn draw(frame: &mut Frame, app: &AppState) {
                 draw_footprint(frame, split[0], app, now_ms);
             }
             draw_signals_log(frame, split[1], app);
+        } else if app.show_rl {
+            draw_rl(frame, outer[1], app);
         } else if app.show_graphs {
             crate::graphs::draw_graphs_panel(frame, outer[1], app);
         } else if app.show_watchlist {
@@ -539,6 +543,15 @@ fn trim_sym(s: &str) -> String {
     }
 }
 
+fn confidence_bar(conf: f64, width: usize) -> String {
+    let cells = ((conf.clamp(0.0, 1.0)) * width as f64).round() as usize;
+    let mut s = String::with_capacity(width);
+    for i in 0..width {
+        s.push(if i < cells { '█' } else { '·' });
+    }
+    s
+}
+
 fn render_sparkline(data: &std::collections::VecDeque<f64>, width: usize) -> String {
     if data.is_empty() {
         return " ".repeat(width);
@@ -618,6 +631,233 @@ fn draw_analytics(frame: &mut Frame, area: Rect, app: &AppState) {
         }
     } else {
         lines.push(Line::from(Span::styled("not enough trades for cumulative PnL chart", Style::default().fg(Color::DarkGray))));
+    }
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_rl(frame: &mut Frame, area: Rect, app: &AppState) {
+    let title = format!(
+        "RL Agent [{enabled}{trainmode}{auto}]",
+        enabled = if app.rl.enabled { "ON" } else { "off" },
+        trainmode = if app.rl.training { " TRAIN" } else { " PREDICT" },
+        auto = if app.rl_auto_trade { " AUTO" } else { "" },
+    );
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height < 4 || inner.width < 24 {
+        return;
+    }
+
+    let mut lines: Vec<Line> = Vec::new();
+    let qs = app.rl.q_all(&app.rl_last_features);
+    let greedy = app.rl.greedy(&app.rl_last_features);
+    let mean_r = app.rl.mean_reward();
+
+    lines.push(Line::from(vec![
+        Span::styled(
+            "Hyperparams: ",
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::raw(format!(
+            "α={:.3}  γ={:.3}  ε={:.3}",
+            app.rl.alpha, app.rl.gamma, app.rl.epsilon
+        )),
+    ]));
+    // Click-to-tune chips for α/γ/ε. Each pair occupies a small row;
+    // hotspots registered for individual chips so users can step values.
+    let row_y = inner.y + lines.len() as u16;
+    if row_y < inner.y + inner.height {
+        let chips: [(u16, &str, ClickAction); 6] = [
+            (0,  "[α-]", ClickAction::RlAlphaDec),
+            (5,  "[α+]", ClickAction::RlAlphaInc),
+            (10, "[γ-]", ClickAction::RlGammaDec),
+            (15, "[γ+]", ClickAction::RlGammaInc),
+            (20, "[ε-]", ClickAction::RlEpsilonDec),
+            (25, "[ε+]", ClickAction::RlEpsilonInc),
+        ];
+        for (off, _, action) in chips.iter() {
+            let rect = Rect { x: inner.x + off, y: row_y, width: 4, height: 1 };
+            hit(rect, action.clone());
+        }
+        let mut spans: Vec<Span> = Vec::new();
+        for (off, label, _) in chips.iter() {
+            // Pad each chip to a fixed 5-char column for alignment.
+            let pad = (off + 4) as usize;
+            spans.push(Span::styled(
+                format!("{:<width$}", label, width = pad - off.saturating_sub(0) as usize + 1),
+                Style::default().fg(Color::Cyan),
+            ));
+            let _ = pad;
+        }
+        lines.push(Line::from("[α-] [α+] [γ-] [γ+] [ε-] [ε+]".to_string()));
+    }
+    lines.push(Line::from(format!(
+        "steps={} episodes={}",
+        app.rl.training_steps, app.rl.episode_count
+    )));
+    lines.push(Line::from(""));
+
+    lines.push(Line::from(Span::styled(
+        "State features",
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    )));
+    let names = crate::rl::feature_names();
+    for k in 0..crate::rl::NUM_FEATURES {
+        let v = app.rl_last_features[k];
+        lines.push(Line::from(format!(
+            "  {:<14} {:>+7.4}",
+            names[k], v
+        )));
+    }
+    lines.push(Line::from(""));
+
+    lines.push(Line::from(Span::styled(
+        "Q-values",
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    )));
+    for a in 0..crate::rl::NUM_ACTIONS {
+        let act = crate::rl::Action::from_idx(a);
+        let star = if act == greedy { "★" } else { " " };
+        let color = if act == greedy { Color::Yellow } else { Color::Gray };
+        let count = app.rl.action_counts[a];
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {star} "), Style::default().fg(color)),
+            Span::styled(act.label().to_string(), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+            Span::raw(format!("  Q={:>+8.4}  n={}", qs[a], count)),
+        ]));
+    }
+    lines.push(Line::from(""));
+    // Prediction + confidence headline so users see what the agent
+    // recommends right now without parsing Q-values manually.
+    let (pred_action, pred_conf) = app.rl.predict(&app.rl_last_features);
+    let conf_color = if pred_conf > 0.5 { Color::Green } else if pred_conf > 0.2 { Color::Yellow } else { Color::DarkGray };
+    lines.push(Line::from(vec![
+        Span::raw("Prediction: "),
+        Span::styled(
+            pred_action.label().to_string(),
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!("  conf {:.2}", pred_conf)),
+        Span::styled(format!(" {}", confidence_bar(pred_conf, 8)), Style::default().fg(conf_color)),
+    ]));
+    // Top 3 features driving the predicted action.
+    let imp = app.rl.feature_importance(pred_action);
+    let names = crate::rl::feature_names();
+    lines.push(Line::from(Span::styled(
+        "Drivers:",
+        Style::default().fg(Color::DarkGray),
+    )));
+    for (k, w) in imp.iter().take(3) {
+        lines.push(Line::from(format!(
+            "  {:<14} w={:>+6.3} ", names[*k], w
+        )));
+    }
+    lines.push(Line::from(""));
+    let rew_color = if mean_r > 0.0 { Color::Green } else if mean_r < 0.0 { Color::Red } else { Color::Gray };
+    lines.push(Line::from(vec![
+        Span::raw("last reward "),
+        Span::styled(
+            format!("{:>+7.4}", app.rl.last_reward),
+            Style::default().fg(if app.rl.last_reward >= 0.0 { Color::Green } else { Color::Red }),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::raw("mean reward "),
+        Span::styled(format!("{:>+7.4}", mean_r), Style::default().fg(rew_color)),
+    ]));
+    lines.push(Line::from(format!("ep reward   {:>+7.4}", app.rl.episode_reward)));
+    // Auto-trade confidence floor with click-to-adjust chips.
+    let chip_dec = Rect { x: inner.x, y: inner.y + lines.len() as u16, width: 5, height: 1 };
+    let chip_inc = Rect { x: inner.x + 6, y: inner.y + lines.len() as u16, width: 5, height: 1 };
+    if chip_dec.y < inner.y + inner.height {
+        hit(chip_dec, ClickAction::RlAutoTradeConfDec);
+        hit(chip_inc, ClickAction::RlAutoTradeConfInc);
+    }
+    lines.push(Line::from(format!(
+        "[ −  ][ + ]  auto-trade conf ≥ {:.2}",
+        app.rl_auto_trade_min_conf
+    )));
+
+    // Reward sparkline so the user can SEE learning progress.
+    if !app.rl.reward_history.is_empty() {
+        let rh: std::collections::VecDeque<f64> = app.rl.reward_history.iter().copied().collect();
+        let spark_w = inner.width.saturating_sub(4) as usize;
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Reward history",
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::from(Span::styled(
+            render_sparkline(&rh, spark_w),
+            Style::default().fg(Color::Cyan),
+        )));
+    }
+
+    // Last backtest summary (rendered when present).
+    if let Some(bt) = &app.rl_last_backtest {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Backtest (greedy)",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )));
+        let r_color = if bt.total_reward > 0.0 { Color::Green }
+            else if bt.total_reward < 0.0 { Color::Red } else { Color::Gray };
+        lines.push(Line::from(vec![
+            Span::raw("  total: "),
+            Span::styled(
+                format!("{:>+8.4}", bt.total_reward),
+                Style::default().fg(r_color).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        lines.push(Line::from(format!(
+            "  avg:   {:>+8.4}", bt.avg_reward
+        )));
+        lines.push(Line::from(format!(
+            "  B/S/H: {} / {} / {}",
+            bt.buys, bt.sells, bt.holds
+        )));
+    }
+
+    // Click-to-toggle hotspots — one row each so users without a keymap
+    // can flip the agent state with a mouse click.
+    let mut chip_y = inner.y + inner.height.saturating_sub(6);
+    let chip_actions: Vec<(String, ClickAction)> = vec![
+        (
+            format!("[{}] enabled", if app.rl.enabled { "x" } else { " " }),
+            ClickAction::ToggleRlEnabled,
+        ),
+        (
+            format!("[{}] training", if app.rl.training { "x" } else { " " }),
+            ClickAction::ToggleRlTraining,
+        ),
+        (
+            format!("[{}] auto-trade", if app.rl_auto_trade { "x" } else { " " }),
+            ClickAction::ToggleRlAutoTrade,
+        ),
+        ("[ backtest ]".into(), ClickAction::RlBacktest),
+        ("[ save ]".into(), ClickAction::RlSave),
+        ("[ reset ]".into(), ClickAction::RlReset),
+        (
+            format!("[{}] Q(λ) traces", if app.rl.use_eligibility { "x" } else { " " }),
+            ClickAction::RlToggleEligibility,
+        ),
+    ];
+    for (label, action) in chip_actions {
+        if chip_y >= inner.y + inner.height { break; }
+        let rect = Rect {
+            x: inner.x,
+            y: chip_y,
+            width: label.chars().count().min(inner.width as usize) as u16,
+            height: 1,
+        };
+        hit(rect, action);
+        lines.push(Line::from(Span::styled(
+            label,
+            Style::default().fg(Color::Cyan),
+        )));
+        chip_y = chip_y.saturating_add(1);
     }
 
     frame.render_widget(Paragraph::new(lines), inner);

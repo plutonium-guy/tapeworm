@@ -11,5 +11,6 @@ pub mod indicators;
 pub mod multi;
 pub mod orderbook;
 pub mod paper;
+pub mod rl;
 pub mod signals;
 pub mod ui;

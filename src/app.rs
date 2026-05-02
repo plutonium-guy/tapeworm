@@ -10,6 +10,7 @@ use crate::engines::{ConnState, SymbolEngines};
 use crate::feed::FeedEvent;
 use crate::multi::SymbolSummary;
 use crate::paper::{BracketRole, Order, OrderStatus, OrderType, PaperEngine};
+use crate::rl::{Action as RlAction, RlAgent};
 
 /// Wall-clock now, in Unix milliseconds.
 pub fn now_ms() -> i64 {
@@ -50,6 +51,22 @@ pub enum ClickAction {
     ToggleVolumeProfile,
     ToggleCumDelta,
     ToggleIndicatorPanel,
+    ToggleRl,
+    ToggleRlEnabled,
+    ToggleRlTraining,
+    ToggleRlAutoTrade,
+    RlSave,
+    RlReset,
+    RlBacktest,
+    RlAutoTradeConfInc,
+    RlAutoTradeConfDec,
+    RlAlphaInc,
+    RlAlphaDec,
+    RlGammaInc,
+    RlGammaDec,
+    RlEpsilonInc,
+    RlEpsilonDec,
+    RlToggleEligibility,
 }
 
 /// A click-dispatch hotspot: a rectangle on the terminal grid plus the
@@ -102,6 +119,23 @@ pub struct AppState {
     pub mid_history: std::collections::VecDeque<f64>,
     /// Rolling working-order count samples (taken on every event).
     pub working_orders_history: std::collections::VecDeque<f64>,
+    pub rl: RlAgent,
+    /// Whether the RL panel is visible.
+    pub show_rl: bool,
+    /// When true, the agent's recommended action submits a paper order.
+    pub rl_auto_trade: bool,
+    /// Minimum prediction-confidence required before an auto-trade fires.
+    /// Acts as a safety floor so a near-tied Q-value (uncertain agent)
+    /// does not trigger a market order.
+    pub rl_auto_trade_min_conf: f64,
+    /// Last marked unrealized PnL — diffed across steps for the reward.
+    rl_last_unrealized: rust_decimal::Decimal,
+    /// Last realized PnL — diffed for the close-reward bonus.
+    rl_last_realized: rust_decimal::Decimal,
+    /// Most recent feature vector — kept for inspection in the panel.
+    pub rl_last_features: [f64; crate::rl::NUM_FEATURES],
+    pub rl_last_action: RlAction,
+    pub rl_last_backtest: Option<crate::rl::BacktestResult>,
     /// Hotspots captured by the most recent draw — main loop dispatches
     /// mouse clicks against this list.
     pub hit_map: Vec<Hotspot>,
@@ -135,6 +169,15 @@ impl AppState {
             tps_history: std::collections::VecDeque::with_capacity(128),
             mid_history: std::collections::VecDeque::with_capacity(240),
             working_orders_history: std::collections::VecDeque::with_capacity(120),
+            rl: RlAgent::default(),
+            show_rl: false,
+            rl_auto_trade: false,
+            rl_auto_trade_min_conf: 0.25,
+            rl_last_unrealized: rust_decimal::Decimal::ZERO,
+            rl_last_realized: rust_decimal::Decimal::ZERO,
+            rl_last_features: [0.0; crate::rl::NUM_FEATURES],
+            rl_last_action: RlAction::Hold,
+            rl_last_backtest: None,
             hit_map: Vec::new(),
             alert_flash_until_ms: None,
             signals_filter: None,
@@ -177,6 +220,105 @@ impl AppState {
         self.record_spread_sample();
         self.record_working_orders_sample();
         self.sync_analytics(event_time_ms);
+        // RL step happens after all engines have settled. We only step on
+        // trade events so the agent doesn't update many times per book diff.
+        if trade_for_paper.is_some() {
+            self.rl_step(event_time_ms);
+        }
+    }
+
+    /// Build a feature vector, compute the reward earned since the last
+    /// step, hand both to the agent, and (optionally) act on its
+    /// recommendation by submitting a paper market order.
+    fn rl_step(&mut self, time_ms: i64) {
+        if !self.rl.enabled {
+            return;
+        }
+        let realized = self.paper.position.realized_pnl;
+        let unrealized = self.paper.unrealized_pnl();
+        let realized_delta = realized - self.rl_last_realized;
+        let unrealized_delta = unrealized - self.rl_last_unrealized;
+        self.rl_last_realized = realized;
+        self.rl_last_unrealized = unrealized;
+        // Reward = sum of changes scaled to a small magnitude so weights
+        // stay numerically tame (PnL in dollars can be large vs features).
+        let raw: f64 = (realized_delta + unrealized_delta).try_into().unwrap_or(0.0);
+        let reward = (raw / 10.0).clamp(-5.0, 5.0);
+
+        let features = crate::rl::extract_features(self);
+        self.rl_last_features = features;
+        let action = self.rl.step(features, reward);
+        self.rl_last_action = action;
+
+        if self.rl_auto_trade {
+            // Only act when the prediction is confidently better than the
+            // alternatives — otherwise an uncertain (near-tied) Q-value
+            // would still fire orders. The user controls the floor via
+            // `rl_auto_trade_min_conf`.
+            let (_, conf) = self.rl.predict(&features);
+            if conf >= self.rl_auto_trade_min_conf {
+                match action {
+                    RlAction::Buy => self.paper_market_buy(time_ms),
+                    RlAction::Sell => self.paper_market_sell(time_ms),
+                    RlAction::Close => self.paper_flatten(time_ms),
+                    RlAction::Hold => {}
+                }
+            }
+        }
+    }
+
+    pub fn rl_auto_trade_min_conf_inc(&mut self) {
+        self.rl_auto_trade_min_conf = (self.rl_auto_trade_min_conf + 0.05).min(1.0);
+    }
+    pub fn rl_auto_trade_min_conf_dec(&mut self) {
+        self.rl_auto_trade_min_conf = (self.rl_auto_trade_min_conf - 0.05).max(0.0);
+    }
+    pub fn rl_alpha_inc(&mut self) {
+        self.rl.alpha = (self.rl.alpha + 0.01).min(1.0);
+    }
+    pub fn rl_alpha_dec(&mut self) {
+        self.rl.alpha = (self.rl.alpha - 0.01).max(0.001);
+    }
+    pub fn rl_gamma_inc(&mut self) {
+        self.rl.gamma = (self.rl.gamma + 0.01).min(0.999);
+    }
+    pub fn rl_gamma_dec(&mut self) {
+        self.rl.gamma = (self.rl.gamma - 0.01).max(0.5);
+    }
+    pub fn rl_epsilon_inc(&mut self) {
+        self.rl.epsilon = (self.rl.epsilon + 0.05).min(1.0);
+    }
+    pub fn rl_epsilon_dec(&mut self) {
+        self.rl.epsilon = (self.rl.epsilon - 0.05).max(0.0);
+    }
+
+    pub fn toggle_rl_panel(&mut self) { self.show_rl = !self.show_rl; }
+    pub fn toggle_rl_enabled(&mut self) {
+        self.rl.enabled = !self.rl.enabled;
+        if self.rl.enabled { self.rl.reset_episode(); }
+    }
+    pub fn toggle_rl_training(&mut self) { self.rl.training = !self.rl.training; }
+    pub fn toggle_rl_auto_trade(&mut self) { self.rl_auto_trade = !self.rl_auto_trade; }
+    pub fn rl_save(&self) -> std::io::Result<()> {
+        self.rl.save("rl-weights.txt")
+    }
+    pub fn rl_load(&mut self) -> std::io::Result<()> {
+        self.rl.load("rl-weights.txt")
+    }
+    pub fn rl_reset(&mut self) {
+        self.rl.reset_weights();
+        self.rl_last_backtest = None;
+    }
+    pub fn rl_run_backtest(&mut self) {
+        let closes: Vec<f64> = self
+            .active
+            .candles
+            .completed()
+            .iter()
+            .chain(self.active.candles.forming().into_iter())
+            .map(|b| b.close)
+            .collect();
+        self.rl_last_backtest = Some(self.rl.backtest(&closes));
     }
 
     /// Apply a feed event for a non-active symbol.
@@ -444,6 +586,27 @@ impl AppState {
             ClickAction::ToggleVolumeProfile => self.chart.toggle_volume_profile(),
             ClickAction::ToggleCumDelta => self.chart.toggle_cum_delta(),
             ClickAction::ToggleIndicatorPanel => self.chart.toggle_indicator_panel(),
+            ClickAction::ToggleRl => self.toggle_rl_panel(),
+            ClickAction::ToggleRlEnabled => self.toggle_rl_enabled(),
+            ClickAction::ToggleRlTraining => self.toggle_rl_training(),
+            ClickAction::ToggleRlAutoTrade => self.toggle_rl_auto_trade(),
+            ClickAction::RlSave => {
+                let _ = self.rl_save();
+            }
+            ClickAction::RlReset => self.rl_reset(),
+            ClickAction::RlBacktest => self.rl_run_backtest(),
+            ClickAction::RlAutoTradeConfInc => self.rl_auto_trade_min_conf_inc(),
+            ClickAction::RlAutoTradeConfDec => self.rl_auto_trade_min_conf_dec(),
+            ClickAction::RlAlphaInc => self.rl_alpha_inc(),
+            ClickAction::RlAlphaDec => self.rl_alpha_dec(),
+            ClickAction::RlGammaInc => self.rl_gamma_inc(),
+            ClickAction::RlGammaDec => self.rl_gamma_dec(),
+            ClickAction::RlEpsilonInc => self.rl_epsilon_inc(),
+            ClickAction::RlEpsilonDec => self.rl_epsilon_dec(),
+            ClickAction::RlToggleEligibility => {
+                self.rl.use_eligibility = !self.rl.use_eligibility;
+                self.rl.reset_traces();
+            }
         }
     }
 
@@ -742,6 +905,61 @@ mod tests {
         assert!(!app.show_footprint);
         app.toggle_footprint();
         assert!(app.show_footprint);
+    }
+
+    #[test]
+    fn rl_hyperparam_chips_clamp_to_safe_ranges() {
+        let mut app = AppState::new("BTCUSDT");
+        // Drive each side hard to verify clamping kicks in.
+        for _ in 0..200 { app.rl_alpha_inc(); }
+        assert!(app.rl.alpha <= 1.0);
+        for _ in 0..200 { app.rl_alpha_dec(); }
+        assert!(app.rl.alpha >= 0.001);
+        for _ in 0..200 { app.rl_gamma_inc(); }
+        assert!(app.rl.gamma <= 0.999);
+        for _ in 0..200 { app.rl_gamma_dec(); }
+        assert!(app.rl.gamma >= 0.5);
+        for _ in 0..200 { app.rl_epsilon_inc(); }
+        assert!(app.rl.epsilon <= 1.0);
+        for _ in 0..200 { app.rl_epsilon_dec(); }
+        assert!(app.rl.epsilon >= 0.0);
+    }
+
+    #[test]
+    fn rl_auto_trade_min_conf_inc_dec_clamped() {
+        let mut app = AppState::new("BTCUSDT");
+        app.rl_auto_trade_min_conf = 0.0;
+        app.rl_auto_trade_min_conf_dec(); // floors at 0
+        assert!(app.rl_auto_trade_min_conf >= 0.0);
+        app.rl_auto_trade_min_conf_inc();
+        let after = app.rl_auto_trade_min_conf;
+        assert!(after > 0.0 && after <= 1.0);
+        for _ in 0..50 { app.rl_auto_trade_min_conf_inc(); }
+        assert!(app.rl_auto_trade_min_conf <= 1.0, "must clamp to 1.0");
+    }
+
+    #[test]
+    fn rl_predict_drives_auto_trade_gate() {
+        // Direct check: when predict's confidence is below the configured
+        // floor, the application's gating logic must prevent an order
+        // from being submitted via the RL path. Below we drive predict
+        // explicitly and assert the gate decision.
+        let mut app = AppState::new("BTCUSDT");
+        app.rl_auto_trade = true;
+        app.rl_auto_trade_min_conf = 0.5;
+
+        // Tied Q-values → confidence ≈ 0.
+        let tied = [0.0_f64; crate::rl::NUM_FEATURES];
+        let (_, c0) = app.rl.predict(&tied);
+        assert!(c0 < app.rl_auto_trade_min_conf);
+
+        // Lopsided Q-values → high confidence.
+        app.rl.weights[crate::rl::Action::Buy.idx()][0] = 5.0;
+        let mut s = [0.0_f64; crate::rl::NUM_FEATURES];
+        s[0] = 1.0;
+        let (act, c1) = app.rl.predict(&s);
+        assert_eq!(act, crate::rl::Action::Buy);
+        assert!(c1 >= app.rl_auto_trade_min_conf);
     }
 
     #[test]
