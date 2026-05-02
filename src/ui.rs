@@ -8,9 +8,33 @@ use time::OffsetDateTime;
 use time::format_description::FormatItem;
 use time::macros::format_description;
 
-use crate::app::{AppState, ConnState};
+use std::cell::RefCell;
+
+use crate::app::{AppState, ClickAction, Hotspot};
+use crate::engines::ConnState;
 use crate::delta::Side;
 use crate::footprint::{FootprintBar, Imbalance};
+use crate::paper::OrderStatus;
+
+thread_local! {
+    static HITS: RefCell<Vec<Hotspot>> = RefCell::new(Vec::new());
+}
+
+pub fn take_hits() -> Vec<Hotspot> {
+    HITS.with(|h| std::mem::take(&mut *h.borrow_mut()))
+}
+
+pub(crate) fn hit(area: Rect, action: ClickAction) {
+    HITS.with(|h| {
+        h.borrow_mut().push(Hotspot {
+            x: area.x,
+            y: area.y,
+            w: area.width,
+            h: area.height,
+            action,
+        });
+    });
+}
 
 const TIME_FMT: &[FormatItem<'_>] = format_description!("[hour]:[minute]:[second]");
 const HHMM_FMT: &[FormatItem<'_>] = format_description!("[hour]:[minute]");
@@ -19,7 +43,7 @@ pub fn draw(frame: &mut Frame, app: &AppState) {
     let area = frame.area();
     let now_ms = current_unix_ms();
 
-    let lower_active = (app.show_footprint || app.show_chart) && area.height > 18;
+    let lower_active = (app.show_footprint || app.show_chart || app.show_analytics || app.show_watchlist || app.show_graphs) && area.height > 18;
     let constraints: Vec<Constraint> = if lower_active {
         let lower_h = ((area.height as i32 - 1) / 2).clamp(12, 30) as u16;
         vec![
@@ -35,26 +59,108 @@ pub fn draw(frame: &mut Frame, app: &AppState) {
         .constraints(constraints.clone())
         .split(area);
 
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(35),
-            Constraint::Percentage(35),
-            Constraint::Percentage(30),
-        ])
-        .split(outer[0]);
+    let cols = if app.show_paper {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(28),
+                Constraint::Percentage(30),
+                Constraint::Percentage(22),
+                Constraint::Percentage(20),
+            ])
+            .split(outer[0])
+    } else {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(35),
+                Constraint::Percentage(35),
+                Constraint::Percentage(30),
+            ])
+            .split(outer[0])
+    };
 
     draw_dom(frame, cols[0], app);
     draw_tape(frame, cols[1], app);
     draw_delta(frame, cols[2], app);
+    if app.show_paper && cols.len() == 4 {
+        draw_paper(frame, cols[3], app);
+    }
 
     if constraints.len() == 3 {
-        if app.show_chart {
+        if app.show_signals_log {
+            let split = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Min(30), Constraint::Length(40)])
+                .split(outer[1]);
+            if app.show_graphs {
+                crate::graphs::draw_graphs_panel(frame, split[0], app);
+            } else if app.show_watchlist {
+                draw_watchlist(frame, split[0], app);
+            } else if app.show_analytics {
+                draw_analytics(frame, split[0], app);
+            } else if app.show_chart {
+                crate::chart::draw(frame, split[0], app);
+            } else {
+                draw_footprint(frame, split[0], app, now_ms);
+            }
+            draw_signals_log(frame, split[1], app);
+        } else if app.show_graphs {
+            crate::graphs::draw_graphs_panel(frame, outer[1], app);
+        } else if app.show_watchlist {
+            draw_watchlist(frame, outer[1], app);
+        } else if app.show_analytics {
+            draw_analytics(frame, outer[1], app);
+        } else if app.show_chart {
             crate::chart::draw(frame, outer[1], app);
         } else {
             draw_footprint(frame, outer[1], app, now_ms);
         }
         draw_status(frame, outer[2], app);
+    } else if app.show_signals_log {
+        // Signals log alone in lower area when no other lower panel.
+        let lower_h: u16 = (area.height / 3).max(8);
+        if area.height > lower_h + 5 {
+            let outer2 = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Min(6),
+                    Constraint::Length(lower_h),
+                    Constraint::Length(1),
+                ])
+                .split(area);
+            // Re-render top columns (with paper if visible).
+            let cols = if app.show_paper {
+                Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([
+                        Constraint::Percentage(28),
+                        Constraint::Percentage(30),
+                        Constraint::Percentage(22),
+                        Constraint::Percentage(20),
+                    ])
+                    .split(outer2[0])
+            } else {
+                Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([
+                        Constraint::Percentage(35),
+                        Constraint::Percentage(35),
+                        Constraint::Percentage(30),
+                    ])
+                    .split(outer2[0])
+            };
+            draw_dom(frame, cols[0], app);
+            draw_tape(frame, cols[1], app);
+            draw_delta(frame, cols[2], app);
+            if app.show_paper && cols.len() == 4 {
+                draw_paper(frame, cols[3], app);
+            }
+            draw_signals_log(frame, outer2[1], app);
+            draw_status(frame, outer2[2], app);
+            return;
+        }
+        draw_status(frame, outer[1], app);
     } else {
         draw_status(frame, outer[1], app);
     }
@@ -68,16 +174,16 @@ fn current_unix_ms() -> i64 {
 fn draw_dom(frame: &mut Frame, area: Rect, app: &AppState) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(format!("DOM — {}", app.symbol));
+        .title(format!("DOM — {}", app.active.symbol));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    if !app.has_snapshot {
+    if !app.active.has_snapshot {
         let p = Paragraph::new("syncing order book…").style(Style::default().fg(Color::Yellow));
         frame.render_widget(p, inner);
         return;
     }
-    if app.book.is_stale() {
+    if app.active.book.is_stale() {
         let p = Paragraph::new(Line::from(vec![
             Span::styled(
                 "STALE — RESYNCING",
@@ -98,8 +204,8 @@ fn draw_dom(frame: &mut Frame, area: Rect, app: &AppState) {
     // 1 row reserved for spread separator.
     let per_side = (height - 1) / 2;
 
-    let asks: Vec<(Decimal, Decimal)> = app.book.asks.iter_asc().take(per_side).collect();
-    let bids: Vec<(Decimal, Decimal)> = app.book.bids.iter_desc().take(per_side).collect();
+    let asks: Vec<(Decimal, Decimal)> = app.active.book.asks.iter_asc().take(per_side).collect();
+    let bids: Vec<(Decimal, Decimal)> = app.active.book.bids.iter_desc().take(per_side).collect();
 
     let max_qty = asks
         .iter()
@@ -119,7 +225,7 @@ fn draw_dom(frame: &mut Frame, area: Rect, app: &AppState) {
     }
 
     // Spread separator.
-    let spread = app.book.spread().map(|s| s.normalize().to_string()).unwrap_or_else(|| "?".into());
+    let spread = app.active.book.spread().map(|s| s.normalize().to_string()).unwrap_or_else(|| "?".into());
     lines.push(Line::from(vec![Span::styled(
         format!("─── spread {spread} ───"),
         Style::default().fg(Color::DarkGray),
@@ -168,7 +274,7 @@ fn draw_tape(frame: &mut Frame, area: Rect, app: &AppState) {
     let max_rows = inner.height as usize;
     let mut lines: Vec<Line> = Vec::with_capacity(max_rows);
 
-    for entry in app.tape.iter().take(max_rows) {
+    for entry in app.active.tape.iter().take(max_rows) {
         let (color, marker) = match entry.trade.side {
             Side::Buy => (Color::Green, "▲"),
             Side::Sell => (Color::Red, "▼"),
@@ -196,11 +302,11 @@ fn draw_delta(frame: &mut Frame, area: Rect, app: &AppState) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let buy = app.delta.buy_volume();
-    let sell = app.delta.sell_volume();
-    let net = app.delta.delta();
-    let total = app.delta.total_volume();
-    let count = app.delta.trade_count();
+    let buy = app.active.delta.buy_volume();
+    let sell = app.active.delta.sell_volume();
+    let net = app.active.delta.delta();
+    let total = app.active.delta.total_volume();
+    let count = app.active.delta.trade_count();
 
     let net_color = if net.is_sign_negative() {
         Color::Red
@@ -236,7 +342,7 @@ fn draw_delta(frame: &mut Frame, area: Rect, app: &AppState) {
         ratio_bar(app, inner.width.saturating_sub(2) as usize),
     ];
 
-    if let (Some((bb, _)), Some((ba, _))) = (app.book.best_bid(), app.book.best_ask()) {
+    if let (Some((bb, _)), Some((ba, _))) = (app.active.book.best_bid(), app.active.book.best_ask()) {
         lines.push(Line::from(""));
         lines.push(Line::from(format!("Best bid: {}", fmt_price(bb))));
         lines.push(Line::from(format!("Best ask: {}", fmt_price(ba))));
@@ -246,7 +352,7 @@ fn draw_delta(frame: &mut Frame, area: Rect, app: &AppState) {
 }
 
 fn ratio_bar(app: &AppState, width: usize) -> Line<'static> {
-    let ratio = app.delta.buy_ratio().unwrap_or(0.5);
+    let ratio = app.active.delta.buy_ratio().unwrap_or(0.5);
     let buy_cells = (ratio * width as f64).round() as usize;
     let buy_cells = buy_cells.min(width);
     let sell_cells = width - buy_cells;
@@ -257,16 +363,17 @@ fn ratio_bar(app: &AppState, width: usize) -> Line<'static> {
 }
 
 fn draw_status(frame: &mut Frame, area: Rect, app: &AppState) {
-    let conn = match app.conn {
+    let conn = match app.active.conn {
         ConnState::Connected => Span::styled("●LIVE", Style::default().fg(Color::Green)),
         ConnState::Disconnected => Span::styled("○OFF ", Style::default().fg(Color::Red)),
     };
     let spread = app
+        .active
         .book
         .spread()
         .map(|s| s.normalize().to_string())
         .unwrap_or_else(|| "—".into());
-    let stale = if app.book.is_stale() {
+    let stale = if app.active.book.is_stale() {
         Span::styled(" STALE ", Style::default().fg(Color::Black).bg(Color::Yellow))
     } else {
         Span::raw("")
@@ -282,22 +389,423 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &AppState) {
         ),
         _ => Span::raw(""),
     };
-    let line = Line::from(vec![
+    let prefix = vec![
         Span::styled(
             "TAPEWORM ",
             Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan),
         ),
-        Span::raw(format!("{} ", app.symbol)),
+        Span::raw(format!("{} ", app.active.symbol)),
         conn,
         Span::raw(format!("  spread {spread}")),
-        Span::raw(format!("  evt {}", app.event_count)),
+        Span::raw(format!("  evt {}", app.active.event_count)),
         Span::raw("  "),
         stale,
         Span::raw(" "),
         alert_flash,
-        Span::raw("  [q]quit [r]reset [f]fp [c]chart [1-5]tf [t]type [v]vol [i]ind [x]cross"),
-    ]);
-    frame.render_widget(Paragraph::new(line), area);
+        Span::raw("  "),
+    ];
+    let prefix_w: u16 = prefix
+        .iter()
+        .map(|s| s.content.chars().count() as u16)
+        .sum();
+    // Build clickable [key]label chips and register hotspots.
+    let chips: [(&str, ClickAction); 9] = [
+        ("[q]quit", ClickAction::Quit),
+        ("[r]reset", ClickAction::Reset),
+        ("[f]fp", ClickAction::ToggleFootprint),
+        ("[c]chart", ClickAction::ToggleChart),
+        ("[G]graphs", ClickAction::ToggleGraphs),
+        ("[w]watch", ClickAction::ToggleWatchlist),
+        ("[s]sig", ClickAction::ToggleSignalsLog),
+        ("[p]pap", ClickAction::TogglePaper),
+        ("[z]anly", ClickAction::ToggleAnalytics),
+    ];
+    let mut spans: Vec<Span> = prefix;
+    let mut col = area.x + prefix_w.min(area.width.saturating_sub(1));
+    for (label, action) in chips {
+        let w = label.chars().count() as u16;
+        let rect = Rect { x: col, y: area.y, width: w, height: 1 };
+        hit(rect, action.clone());
+        spans.push(Span::styled(label.to_string(), Style::default().fg(Color::Cyan)));
+        spans.push(Span::raw(" "));
+        col = col.saturating_add(w + 1);
+        if col >= area.x + area.width {
+            break;
+        }
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn draw_watchlist(frame: &mut Frame, area: Rect, app: &AppState) {
+    let block = Block::default().borders(Borders::ALL).title("Watchlist");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height < 2 || inner.width < 30 { return; }
+
+    let mut lines: Vec<Line> = Vec::with_capacity(app.watchlist.len() + 1);
+    lines.push(Line::from(Span::styled(
+        " sym       last     %chg     Δ        vol      spark",
+        Style::default().fg(Color::DarkGray),
+    )));
+    for (i, s) in app.watchlist.iter().enumerate() {
+        let chg = s.change_from_open_pct().unwrap_or(0.0);
+        let chg_color = if chg < 0.0 { Color::Red } else if chg > 0.0 { Color::Green } else { Color::Gray };
+        let delta_color = if s.delta() < 0.0 { Color::Red } else if s.delta() > 0.0 { Color::Green } else { Color::Gray };
+        let conn_marker = if s.connected { "●" } else { "○" };
+        let conn_color = if s.connected { Color::Green } else { Color::Red };
+        let spark = render_sparkline(&s.sparkline, 24);
+        let row_y = inner.y + 1 + i as u16; // +1 for header row
+        if row_y < inner.y + inner.height {
+            hit(
+                Rect { x: inner.x, y: row_y, width: inner.width, height: 1 },
+                ClickAction::SwitchActive(s.symbol.clone()),
+            );
+        }
+        let line = Line::from(vec![
+            Span::styled(conn_marker.to_string(), Style::default().fg(conn_color)),
+            Span::raw(" "),
+            Span::styled(format!("{:<8}", s.symbol), Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(format!(" {:>9.2}", s.last_price)),
+            Span::styled(format!(" {:>+6.2}%", chg), Style::default().fg(chg_color)),
+            Span::styled(format!(" {:>+10.4}", s.delta()), Style::default().fg(delta_color)),
+            Span::raw(format!(" {:>9.2}", s.total_volume())),
+            Span::raw(" "),
+            Span::styled(spark, Style::default().fg(chg_color)),
+        ]);
+        lines.push(line);
+    }
+    if app.watchlist.is_empty() {
+        lines.push(Line::from(Span::styled("(no symbols watched)", Style::default().fg(Color::DarkGray))));
+    }
+
+    // Correlation matrix (pairwise Pearson over sparkline samples).
+    if app.watchlist.len() >= 2 {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Correlation (last 30 1-min closes)",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )));
+        let mut header = String::from("        ");
+        for s in &app.watchlist {
+            header.push_str(&format!("{:>8}", trim_sym(&s.symbol)));
+        }
+        lines.push(Line::from(Span::styled(header, Style::default().fg(Color::DarkGray))));
+        for (i, a) in app.watchlist.iter().enumerate() {
+            let mut spans: Vec<Span> = Vec::new();
+            spans.push(Span::styled(
+                format!("{:<8}", trim_sym(&a.symbol)),
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+            for (j, b) in app.watchlist.iter().enumerate() {
+                if i == j {
+                    spans.push(Span::styled("    1.00".to_string(), Style::default().fg(Color::DarkGray)));
+                    continue;
+                }
+                let av: Vec<f64> = a.sparkline.iter().copied().collect();
+                let bv: Vec<f64> = b.sparkline.iter().copied().collect();
+                let n = av.len().min(bv.len());
+                if n < 4 {
+                    spans.push(Span::raw("       —"));
+                    continue;
+                }
+                let av = &av[av.len() - n..];
+                let bv = &bv[bv.len() - n..];
+                let c = crate::multi::correlation(av, bv).unwrap_or(0.0);
+                let color = if c > 0.6 {
+                    Color::Green
+                } else if c < -0.6 {
+                    Color::Red
+                } else {
+                    Color::Gray
+                };
+                spans.push(Span::styled(
+                    format!("  {:>+5.2}", c),
+                    Style::default().fg(color),
+                ));
+            }
+            lines.push(Line::from(spans));
+        }
+    }
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn trim_sym(s: &str) -> String {
+    let s = s.to_uppercase();
+    if s.ends_with("USDT") {
+        s[..s.len() - 4].to_string()
+    } else {
+        s
+    }
+}
+
+fn render_sparkline(data: &std::collections::VecDeque<f64>, width: usize) -> String {
+    if data.is_empty() {
+        return " ".repeat(width);
+    }
+    let chars = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let lo = data.iter().copied().fold(f64::INFINITY, f64::min);
+    let hi = data.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let span = (hi - lo).max(1e-9);
+    let mut out = String::with_capacity(width);
+    let take = data.iter().rev().take(width).rev();
+    for v in take {
+        let frac = ((v - lo) / span).clamp(0.0, 1.0);
+        let idx = (frac * (chars.len() as f64 - 1.0)).round() as usize;
+        out.push(chars[idx.min(chars.len() - 1)]);
+    }
+    out
+}
+
+fn draw_analytics(frame: &mut Frame, area: Rect, app: &AppState) {
+    let block = Block::default().borders(Borders::ALL).title("Analytics");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height < 4 || inner.width < 30 { return; }
+
+    let a = &app.analytics;
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(vec![Span::styled(
+        format!("Trades: {}    Winners: {}    Losers: {}", a.count(), a.winners(), a.losers()),
+        Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan),
+    )]));
+    let pnl = a.total_pnl();
+    let pnl_color = if pnl.is_sign_negative() { Color::Red } else if pnl.is_zero() { Color::Gray } else { Color::Green };
+    lines.push(Line::from(vec![
+        Span::raw("Total PnL:    "),
+        Span::styled(format!("{:>+10.2}", pnl), Style::default().fg(pnl_color).add_modifier(Modifier::BOLD)),
+    ]));
+    if let Some(wr) = a.win_rate() {
+        lines.push(Line::from(format!("Win rate:     {:>10.1}%", wr * 100.0)));
+    }
+    if let Some(pf) = a.profit_factor() {
+        lines.push(Line::from(format!("Profit factor:{:>10.2}", pf)));
+    }
+    if let Some(exp) = a.expectancy() {
+        lines.push(Line::from(format!("Expectancy:   {:>+10.4}", exp)));
+    }
+    if let Some(w) = a.avg_winner() {
+        lines.push(Line::from(format!("Avg winner:   {:>+10.2}", w)));
+    }
+    if let Some(l) = a.avg_loser() {
+        lines.push(Line::from(format!("Avg loser:    {:>+10.2}", l)));
+    }
+    lines.push(Line::from(format!("Max drawdown: {:>+10.2}", a.max_drawdown())));
+    lines.push(Line::from(format!("Best streak:  {} W / {} L", a.longest_streak(true), a.longest_streak(false))));
+    lines.push(Line::from(""));
+
+    // PnL spark.
+    let cum: Vec<f64> = a
+        .cumulative_pnl()
+        .into_iter()
+        .filter_map(|d| d.try_into().ok())
+        .collect();
+    if cum.len() >= 2 {
+        let w = inner.width.saturating_sub(2) as usize;
+        let n = cum.len().min(w);
+        let lo = cum.iter().copied().fold(f64::INFINITY, f64::min);
+        let hi = cum.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let span = (hi - lo).max(1e-9);
+        let h = inner.height.saturating_sub(lines.len() as u16 + 1).max(3) as usize;
+        let mut grid: Vec<Vec<(char, Style)>> = (0..h).map(|_| (0..n).map(|_| (' ', Style::default())).collect()).collect();
+        for (col, v) in cum.iter().rev().take(n).enumerate() {
+            let r = ((1.0 - (v - lo) / span) * (h as f64 - 1.0)).round().clamp(0.0, (h - 1) as f64) as usize;
+            let color = if *v >= 0.0 { Color::Green } else { Color::Red };
+            grid[r][n - 1 - col] = ('•', Style::default().fg(color));
+        }
+        for row in grid {
+            lines.push(Line::from(row.into_iter().map(|(c, s)| Span::styled(c.to_string(), s)).collect::<Vec<_>>()));
+        }
+    } else {
+        lines.push(Line::from(Span::styled("not enough trades for cumulative PnL chart", Style::default().fg(Color::DarkGray))));
+    }
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_paper(frame: &mut Frame, area: Rect, app: &AppState) {
+    let title = if app.paper.trading_mode { "Paper [LIVE]" } else { "Paper [LOCKED]" };
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 || inner.width == 0 { return; }
+
+    let pos = &app.paper.position;
+    let unr = app.paper.unrealized_pnl();
+    let realized = pos.realized_pnl;
+    let bal = app.paper.balance();
+    let buf = app.paper.daily_loss_buffer();
+    let pos_color = if pos.qty.is_zero() {
+        Color::Gray
+    } else if pos.qty.is_sign_positive() {
+        Color::Green
+    } else {
+        Color::Red
+    };
+
+    let working = app
+        .paper
+        .orders
+        .iter()
+        .filter(|o| matches!(o.status, OrderStatus::Working | OrderStatus::PartialFill))
+        .count();
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::raw("Pos: "),
+        Span::styled(
+            format!("{:>+10.4}", pos.qty),
+            Style::default().fg(pos_color).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!(" @ {}", fmt_price(pos.avg_price))),
+    ]));
+    let unr_color = if unr.is_sign_negative() { Color::Red } else if unr.is_zero() { Color::Gray } else { Color::Green };
+    lines.push(Line::from(vec![
+        Span::raw("uPnL: "),
+        Span::styled(
+            format!("{:>+10.2}", unr),
+            Style::default().fg(unr_color).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    let real_color = if realized.is_sign_negative() { Color::Red } else if realized.is_zero() { Color::Gray } else { Color::Green };
+    lines.push(Line::from(vec![
+        Span::raw("rPnL: "),
+        Span::styled(
+            format!("{:>+10.2}", realized),
+            Style::default().fg(real_color),
+        ),
+    ]));
+    lines.push(Line::from(format!("Bal:  {:>10.2}", bal)));
+    let buf_color = if buf <= rust_decimal::Decimal::ZERO {
+        Color::Red
+    } else {
+        Color::Yellow
+    };
+    lines.push(Line::from(vec![
+        Span::raw("Buf:  "),
+        Span::styled(format!("{:>10.2}", buf), Style::default().fg(buf_color)),
+    ]));
+    lines.push(Line::from(format!("Slip: {:>10.4}", app.paper.session_slippage)));
+    lines.push(Line::from(format!("Qty:  {:>10}", app.paper_qty)));
+    lines.push(Line::from(format!("Wkg:  {working}")));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "[b]buy [B]sell [F]flat [X]cancel [+/-]qty [T]trade-mode",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_signals_log(frame: &mut Frame, area: Rect, app: &AppState) {
+    use crate::signals::SignalKind;
+    let filter_label = match app.signals_filter {
+        None => "all".to_string(),
+        Some(k) => k.label().to_string(),
+    };
+    let title = format!("Signals [{filter_label}]");
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+    let max_rows = inner.height as usize;
+
+    // Header row.
+    let mut lines: Vec<Line> = Vec::with_capacity(max_rows);
+    lines.push(Line::from(Span::styled(
+        format!(" time  type  {:>10}  s  note", "price"),
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let pace_tps = app.active.signals.pace.current_tps();
+    let pace_avg = app
+        .active
+        .signals
+        .pace
+        .session_avg_tps(app.active.event_count as i64 + 1)
+        .unwrap_or(0.0);
+    lines.push(Line::from(Span::styled(
+        format!(
+            " pace cur={:.2}/s  avg={:.2}/s  buy={:.2}  sell={:.2}",
+            pace_tps,
+            pace_avg,
+            app.active.signals.pace.buy_tps(),
+            app.active.signals.pace.sell_tps(),
+        ),
+        Style::default().fg(Color::Cyan),
+    )));
+    lines.push(Line::from(""));
+
+    let filtered: Vec<&crate::signals::Signal> = app
+        .active
+        .signals
+        .log
+        .iter()
+        .filter(|s| match app.signals_filter {
+            None => true,
+            Some(k) => s.kind == k,
+        })
+        .take(max_rows.saturating_sub(3))
+        .collect();
+
+    for (idx, sig) in filtered.iter().enumerate() {
+        // Hotspot for the row (account for the 3 header lines).
+        let row_y = inner.y + 3 + idx as u16;
+        if row_y < inner.y + inner.height {
+            hit(
+                Rect { x: inner.x, y: row_y, width: inner.width, height: 1 },
+                ClickAction::SelectSignalAt(idx),
+            );
+        }
+        let _ = sig;
+        let sig = filtered[idx];
+        let dt = OffsetDateTime::from_unix_timestamp(sig.time_ms / 1000)
+            .unwrap_or(OffsetDateTime::UNIX_EPOCH);
+        let time = dt.format(TIME_FMT).unwrap_or_else(|_| "--:--:--".into());
+        let kind_color = match sig.kind {
+            SignalKind::Iceberg => Color::LightCyan,
+            SignalKind::Absorption => Color::LightMagenta,
+            SignalKind::PaceSpike => Color::LightYellow,
+            SignalKind::StopRun => Color::LightBlue,
+            SignalKind::Exhaustion => Color::LightRed,
+        };
+        let stars: String = "★".repeat(sig.score as usize);
+        let selected = app.show_signals_log && idx == app.signals_sel_idx;
+        let prefix = if selected { "▶" } else { " " };
+        let mut spans = vec![
+            Span::styled(
+                prefix.to_string(),
+                Style::default().fg(if selected { Color::Yellow } else { Color::DarkGray }),
+            ),
+            Span::raw(time.clone()),
+            Span::raw(" "),
+            Span::styled(
+                format!("{:<3}", sig.kind.label()),
+                Style::default().fg(kind_color).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::raw(format!("{:>10}", fmt_price(sig.price))),
+            Span::raw(" "),
+            Span::styled(stars, Style::default().fg(Color::Yellow)),
+            Span::raw(" "),
+            Span::styled(sig.note.clone(), Style::default().fg(Color::Gray)),
+        ];
+        if selected {
+            for span in &mut spans {
+                span.style = span.style.add_modifier(Modifier::REVERSED);
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+    if app.active.signals.log.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "no signals yet",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn fmt_price(p: Decimal) -> String {
@@ -330,10 +838,11 @@ fn draw_footprint(frame: &mut Frame, area: Rect, app: &AppState, now_ms: i64) {
 
     // Newest bars on the right; collect chronologically and keep the last `max_bars`.
     let mut visible: Vec<&FootprintBar> = app
+        .active
         .footprint
         .completed()
         .iter()
-        .chain(app.footprint.forming().into_iter())
+        .chain(app.active.footprint.forming().into_iter())
         .collect();
     if visible.len() > max_bars {
         let drop = visible.len() - max_bars;
@@ -366,7 +875,7 @@ fn draw_footprint(frame: &mut Frame, area: Rect, app: &AppState, now_ms: i64) {
     // If too many prices, center the window around the latest forming bar's close.
     if prices.len() > body_rows as usize {
         let pivot = visible.last().unwrap().close;
-        let pivot_tick = round_to_tick_loose(pivot, app.footprint.tick());
+        let pivot_tick = round_to_tick_loose(pivot, app.active.footprint.tick());
         let pivot_idx = prices
             .iter()
             .position(|p| *p <= pivot_tick)
@@ -380,6 +889,7 @@ fn draw_footprint(frame: &mut Frame, area: Rect, app: &AppState, now_ms: i64) {
 
     // Forming bar = last visible if its end > now_ms.
     let forming_start = app
+        .active
         .footprint
         .forming()
         .map(|b| b.start_ms);
@@ -433,7 +943,7 @@ fn draw_footprint(frame: &mut Frame, area: Rect, app: &AppState, now_ms: i64) {
 
     // Body rows: one per visible price level.
     let last_close = visible.last().map(|b| b.close);
-    let last_close_tick = last_close.map(|p| round_to_tick_loose(p, app.footprint.tick()));
+    let last_close_tick = last_close.map(|p| round_to_tick_loose(p, app.active.footprint.tick()));
 
     for price in prices {
         let mut spans: Vec<Span> = Vec::new();

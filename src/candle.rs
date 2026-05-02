@@ -133,6 +133,11 @@ pub struct CandleEngine {
     base_bar_ms: i64,
     completed: VecDeque<CandleBar>,
     forming: Option<CandleBar>,
+    /// Monotonic count of bars EVER sealed (even after eviction from
+    /// `completed` once the rolling cap is hit). Callers compare against
+    /// a snapshot to detect newly sealed bars without being fooled by
+    /// the FIFO eviction that keeps `completed.len()` constant at the cap.
+    sealed_count: u64,
 
     // Session-wide running totals (from raw trades).
     sum_pv: f64,    // Σ price * qty
@@ -158,6 +163,7 @@ impl CandleEngine {
             base_bar_ms,
             completed: VecDeque::with_capacity(HISTORY_BARS + 1),
             forming: None,
+            sealed_count: 0,
             sum_pv: 0.0,
             sum_v: 0.0,
             sum_pv2: 0.0,
@@ -192,6 +198,7 @@ impl CandleEngine {
             let old = self.forming.take().expect("forming present");
             self.completed.push_back(old);
             self.cum_delta_at_close.push_back(self.cum_delta);
+            self.sealed_count = self.sealed_count.saturating_add(1);
             while self.completed.len() > HISTORY_BARS {
                 self.completed.pop_front();
                 self.cum_delta_at_close.pop_front();
@@ -220,6 +227,13 @@ impl CandleEngine {
 
     pub fn forming(&self) -> Option<&CandleBar> {
         self.forming.as_ref()
+    }
+
+    /// Total bars ever sealed in this engine (does not decrease on
+    /// rolling-window eviction). Use this to detect new bar closes
+    /// reliably even when [`completed`] is at its cap.
+    pub fn sealed_count(&self) -> u64 {
+        self.sealed_count
     }
 
     pub fn cum_delta(&self) -> f64 {
@@ -257,6 +271,7 @@ impl CandleEngine {
         self.completed.clear();
         self.forming = None;
         self.cum_delta_at_close.clear();
+        self.sealed_count = 0;
         self.reset_session();
     }
 
@@ -520,6 +535,19 @@ mod tests {
         let trail: Vec<f64> = e.cum_delta_trail().iter().copied().collect();
         approx(trail[0], 2.0, 1e-9);
         approx(trail[1], 1.0, 1e-9);
+    }
+
+    #[test]
+    fn sealed_count_grows_past_history_cap() {
+        let mut e = CandleEngine::default();
+        // Seal HISTORY_BARS+10 bars by recording one trade per minute.
+        for i in 0..(HISTORY_BARS as i64 + 10) {
+            e.record(&t(i * 60_000, dec!(100), dec!(1), Side::Buy));
+        }
+        // After cap, completed.len() stops growing but sealed_count keeps climbing.
+        assert_eq!(e.completed().len(), HISTORY_BARS);
+        // We sealed 1509 bars (the 1510th is the active forming).
+        assert_eq!(e.sealed_count(), HISTORY_BARS as u64 + 9);
     }
 
     #[test]

@@ -30,8 +30,9 @@ impl Cell {
     /// Imbalance class for this cell.
     pub fn imbalance(&self) -> Imbalance {
         let r = Decimal::from(IMBALANCE_RATIO);
-        let buy_dominant = self.buy > self.sell * r && self.buy > Decimal::ZERO;
-        let sell_dominant = self.sell > self.buy * r && self.sell > Decimal::ZERO;
+        // Spec: "three times or more the sell volume" → use >= (inclusive).
+        let buy_dominant = self.buy >= self.sell * r && self.buy > Decimal::ZERO;
+        let sell_dominant = self.sell >= self.buy * r && self.sell > Decimal::ZERO;
         if buy_dominant {
             Imbalance::Buy
         } else if sell_dominant {

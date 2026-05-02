@@ -1,9 +1,15 @@
+pub mod analytics;
 pub mod app;
 pub mod candle;
 pub mod chart;
 pub mod delta;
+pub mod engines;
 pub mod feed;
 pub mod footprint;
+pub mod graphs;
 pub mod indicators;
+pub mod multi;
 pub mod orderbook;
+pub mod paper;
+pub mod signals;
 pub mod ui;

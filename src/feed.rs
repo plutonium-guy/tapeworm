@@ -53,6 +53,27 @@ struct RawTrade {
     buyer_is_maker: bool,
 }
 
+/// Spawn a tagged feed task that emits `(symbol, FeedEvent)` pairs on a
+/// shared channel. Wraps [`spawn`] with a forwarding task that re-tags
+/// each event with the symbol. The returned [`JoinHandle`] owns both the
+/// inner feed task and the forwarder — aborting it (or the forwarder
+/// exiting because the outer channel closed) tears down the WS task too.
+pub fn spawn_tagged(
+    symbol: String,
+    out: mpsc::Sender<(String, FeedEvent)>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let (inner_tx, mut inner_rx) = mpsc::channel::<FeedEvent>(2048);
+        let inner_handle = spawn(symbol.clone(), inner_tx);
+        while let Some(ev) = inner_rx.recv().await {
+            if out.send((symbol.clone(), ev)).await.is_err() {
+                break;
+            }
+        }
+        inner_handle.abort();
+    })
+}
+
 /// Spawn the feed loop. Sends events to `tx`. Reconnects forever with backoff.
 pub fn spawn(symbol: String, tx: mpsc::Sender<FeedEvent>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {

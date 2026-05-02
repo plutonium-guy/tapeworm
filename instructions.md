@@ -1,562 +1,983 @@
-# TAPEWORM — Phase 3 Agent Build Prompt
-## Advanced Candlestick Chart
+# TAPEWORM — Master Build Prompt
+## Real-Time Order Flow Terminal
 
 ---
 
 ## OPERATING RULES
 
-Same as all previous phases. Plan, build, run, verify, fix,
-then move on. Never skip the verification step. Never assume
-code compiles without running it. Fix errors immediately
-before touching anything else.
+You work in a strict loop on every phase and every step
+within each phase.
 
-Phases 1 and 2 are complete. Do not modify any existing
-behaviour. Phase 3 adds an advanced candlestick chart as a
-new panel. Everything from Phases 1 and 2 continues to work
-unchanged.
+Plan what you will build. Build it. Run it. Verify it works.
+Fix any errors. Only then move to the next step.
 
----
+Never write code across multiple components before verifying
+the first one compiles. Never assume something works without
+running it. If something fails three times, stop and explain
+what is blocking you.
 
-## WHAT IS BEING BUILT
-
-A professional-grade candlestick chart rendered entirely
-inside the terminal. This is not a basic OHLCV chart. It
-integrates order flow data, volume analysis, session
-statistics, and multiple technical overlays into a single
-coherent visualization that updates in real time.
-
-The chart draws from data the application already has —
-the trade feed, the footprint engine, and the delta engine
-from previous phases. No new external data source is
-required.
-
-The design philosophy is the same as the rest of Tapeworm:
-show what is actually happening in the market at the level
-of order flow, not just price and time.
+Do not begin a new phase until the current phase fully
+passes its definition of done. Every phase builds on the
+one before it. Skipping ahead will cause failures that are
+harder to debug than the original problem.
 
 ---
 
-## THE TERMINAL RENDERING CHALLENGE
+## WHAT IS TAPEWORM
 
-A terminal is a fixed grid of character cells. Each cell
-holds one character and one color pair. There are no pixels,
-no subpixel rendering, and no diagonal lines.
+Tapeworm is a real-time order flow terminal that runs
+entirely in the terminal. It is written in Rust.
 
-To achieve high visual resolution within these constraints
-the chart must use Unicode half-block and braille characters.
-Half-block characters divide a cell into a top half and a
-bottom half, each independently colored. This effectively
-doubles the vertical resolution of the chart without
-increasing the number of rows. Braille characters divide
-a cell into an eight-dot grid and can represent up to eight
-independent on-off values per cell, enabling smooth line
-rendering for overlays.
+It connects to live market data, processes the raw stream
+into meaningful order flow signals, and displays everything
+in a terminal UI that updates in real time. It is built for
+traders who want to understand what is actually happening
+in the market at the level of order flow, not just price.
 
-Every rendering decision must account for this constraint.
-Smooth curves do not exist. Lines are approximated. The
-goal is maximum information density within the character
-grid.
+The name comes from the reconstructed tape — the continuous
+stream of every trade that executes, revealing whether
+buyers or sellers are in control moment to moment.
 
----
-
-## CANDLE CONSTRUCTION
-
-All candles are constructed from raw trade data the
-application already receives. The footprint engine from
-Phase 2 already computes open, high, low, close, buy volume,
-sell volume, and delta per time bar. The candle chart engine
-uses this as its data source and extends it with additional
-computed values.
-
-Each completed candle stores everything needed for all
-overlays and indicators: the four prices, both volume
-components, delta, timestamp, and all derived values
-computed at close time such as VWAP contribution,
-typical price, and indicator values.
-
-The current forming candle updates on every trade. All
-overlays and indicators that depend on the current bar
-recalculate in real time as each trade arrives.
+It is inspired by Jigsaw Trading, a professional order flow
+analysis tool used by futures day traders. Tapeworm builds
+everything Jigsaw does and more, running entirely in a
+terminal window as a single Rust binary.
 
 ---
 
-## SUPPORTED TIMEFRAMES
+## DATA SOURCE
 
-Support five timeframes selectable by keyboard shortcut.
-One minute, three minutes, five minutes, fifteen minutes,
-and one hour.
-
-When the user switches timeframes the chart reconstructs
-its history by re-aggregating the stored one-minute bars
-from the footprint engine. This means no historical data
-is lost when switching — the full available history
-re-renders at the new timeframe instantly.
-
-The current timeframe is shown clearly in the chart panel
-header at all times.
+Use the Binance public WebSocket API. It is free, requires
+no API key, no account, and no agreements. It provides a
+depth of market stream and a trade stream. Subscribe to
+both simultaneously over a single connection. Use BTCUSDT
+as the default symbol.
 
 ---
 
-## CANDLE TYPES
+## HOW THE MARKET DATA WORKS
 
-Support three candle rendering modes selectable by keyboard.
+The market produces two continuous streams.
 
-Standard candlesticks show open, high, low, close with
-the body colored by price direction. Bullish candles where
-close is above open are green. Bearish candles where close
-is below open are red. Doji where open and close are within
-one tick of each other render in a neutral color with a
-distinct shape.
+The order book contains all resting limit orders at every
+price level. Buyers place bids below the current price.
+Sellers place asks above it. It changes constantly as
+orders are added, modified, and cancelled. Tapeworm
+maintains a correct snapshot in memory at all times.
 
-Heikin Ashi candles are a smoothed variant. Each Heikin
-Ashi candle's open is the average of the previous candle's
-open and close. Its close is the average of the current
-candle's open, high, low, and close. Its high and low are
-the actual high and low. This smoothing filters out noise
-and makes trends easier to read. The engine must compute
-Heikin Ashi values correctly from the underlying raw data
-and must never confuse Heikin Ashi values with actual
-market prices.
-
-Delta candles use the same OHLC structure as standard
-candles but color each candle by its delta rather than
-its price direction. A candle with positive delta is
-green regardless of whether price went up or down. A
-candle with negative delta is red regardless of price
-direction. This reveals divergences between price movement
-and order flow that are invisible on standard charts.
-
-The current candle type is shown in the chart panel header.
+The trade feed delivers every executed trade with a price,
+quantity, and aggressor side — either a buyer who hit an
+ask or a seller who hit a bid. Tapeworm uses this to track
+buying and selling pressure continuously.
 
 ---
 
-## VOLUME VISUALIZATION
+## DEPENDENCIES TO USE
 
-### Standard Volume Bars
-
-Below the candle area render a volume histogram. Each bar
-represents total volume for that candle period. Bar height
-is proportional to volume relative to the maximum volume
-bar in the current visible window.
-
-Color each volume bar to match its candle. Standard mode
-colors by price direction. Delta mode colors by delta
-direction.
-
-### Delta Volume Stacked Bars
-
-In an advanced volume mode, split each volume bar into
-two segments: the buy volume portion and the sell volume
-portion. Stack them within the same bar height. The buy
-portion is always green and grows from the bottom. The
-sell portion is always red and grows from the top. This
-gives an instant per-bar picture of the buying and selling
-composition without needing to read the footprint.
-
-### Volume Moving Average
-
-Overlay a line on the volume histogram showing the average
-volume over the last twenty bars. Bars that are
-significantly above this average are highlighted, because
-volume spikes at key price levels are important signals.
+tokio for the async runtime. tokio-tungstenite for
+WebSocket. futures-util for async streams. serde and
+serde_json for JSON parsing. ratatui for the TUI framework.
+crossterm for the terminal backend. anyhow for error
+handling. No other dependencies unless a phase explicitly
+requires one.
 
 ---
 
-## PRICE OVERLAYS
+---
 
-### Session VWAP
+# PHASE 1 — Core Terminal
 
-The Volume Weighted Average Price resets at the start of
-each trading session. It represents the average price at
-which all volume has transacted during the session,
-weighted by how much volume occurred at each price.
+## What gets built
 
-Render VWAP as a continuous line overlaid on the candles.
-The line updates in real time with each new trade. VWAP
-is considered the fairest price of the day and acts as a
-dynamic support and resistance level that institutional
-traders reference constantly.
+The foundation of the entire application. A live connection
+to Binance, an in-memory order book, and a three-panel
+terminal UI showing the DOM price ladder, reconstructed
+tape, and delta summary.
 
-Compute VWAP correctly using the running sum of price
-multiplied by volume divided by running total volume.
-Use the typical price (high plus low plus close divided
-by three) for each bar's price contribution.
+## Core concepts
 
-### VWAP Standard Deviation Bands
+The order book has two sides — bids sorted descending and
+asks sorted ascending. Prices must be stored as integer
+ticks internally, never as raw floating point. This is
+mandatory. Floating point equality is unreliable for map
+lookups and will cause silent correctness bugs.
 
-Compute one and two standard deviation bands above and
-below VWAP. These bands represent statistically unusual
-prices relative to the session's volume distribution.
-Price beyond two standard deviations is considered
-extended and often reverts toward VWAP.
+Delta is buy-initiated volume minus sell-initiated volume.
+Binance provides a field per trade indicating whether the
+buyer was the maker. If the buyer was the maker the seller
+was the aggressor — classify it as a sell trade. Otherwise
+classify it as a buy trade.
 
-Render the first standard deviation band as a subtle
-shaded region. Render the second standard deviation band
-as a more prominent line. Label both clearly on the
-price axis.
+The order book can fall out of sync if a message is missed.
+When that happens mark the book as stale and show this in
+the UI rather than displaying potentially incorrect data.
 
-### Exponential Moving Averages
+The feed runs on a background async task. The UI renders
+on its own cadence. They communicate only through a
+buffered channel. The UI never blocks waiting for market
+data. All rolling buffers have a maximum size and drop
+old entries when full.
 
-Support three configurable EMA lines rendered as overlays
-on the candle chart. Default values are nine period,
-twenty-one period, and fifty period EMAs.
+## Features
 
-Each EMA line is a different color and labeled on the
-right side of the chart at its current value. EMA lines
-use braille dot rendering to appear smooth despite the
-terminal grid constraint.
+DOM price ladder showing top price levels on both sides.
+Asks in red above the spread, bids in green below. Each
+level shows quantity and a proportional horizontal bar.
+Best bid and ask are visually emphasized. Stale state
+shown clearly when the book loses sync.
 
-The user can toggle individual EMA lines on and off with
-keyboard shortcuts.
+Reconstructed tape showing every trade as it happens.
+Most recent at the top. Each entry shows time, price,
+quantity, and direction. Buys in green with an upward
+indicator. Sells in red with a downward indicator. Large
+trades visually distinguished. Older trades scroll off.
 
-### Cumulative Delta Line
+Delta panel showing session buy volume, sell volume,
+total volume, net delta, and a ratio bar. Delta number
+green when positive, red when negative.
 
-Render the running cumulative delta as a line overlaid
-on the candle chart, scaled to a secondary axis on the
-left side of the chart. This line shows the cumulative
-buying versus selling pressure throughout the session
-and makes divergences between price and delta
-immediately visible.
+Status bar at the bottom showing application name,
+symbol, current spread, total events received, and
+keyboard shortcut reminders.
 
-When price makes a new high but cumulative delta does not
-make a new high, this is a bearish delta divergence.
-When price makes a new low but cumulative delta does not
-make a new low, this is a bullish delta divergence.
-These divergences are automatically detected and marked
-on the chart with a small indicator.
+Keyboard controls: q or Escape to exit cleanly, r to
+reset delta counters.
+
+Automatic reconnection when the feed drops. No manual
+restart required. Status bar reflects connection state.
+
+## Build order
+
+Connect to Binance and verify live data arrives before
+building anything else. Then build the order book engine
+with unit tests. Then the delta engine with unit tests.
+Then wire them together. Then build the UI panels. Then
+the main event loop.
+
+## Definition of done
+
+All unit tests pass. Binary connects within three seconds.
+All three panels show correct live data. Large trades
+distinguished in tape. q restores the terminal. Reconnection
+works. Ten minutes stable with no panic or memory growth.
 
 ---
 
-## VOLUME PROFILE
+---
 
-The volume profile is a horizontal histogram rendered on
-the right side of the chart showing how much total volume
-traded at each price level across the entire visible
-session.
+# PHASE 2 — Footprint Chart
 
-Each horizontal bar extends rightward from the price axis.
-Its length represents the relative volume at that price
-compared to the maximum volume price level.
+## What gets built
 
-### Point of Control
+A footprint chart panel showing buy and sell volume at
+every price level within each time bar. The most
+information-dense visualization in order flow trading.
 
-The price level with the highest volume in the session is
-the Point of Control. It is the fairest price the market
-has found and acts as a magnet. Render it as a visually
-distinct horizontal line extending across the entire
-chart with a label.
+## Core concept
 
-### Value Area
+A standard candle shows open, high, low, close, and total
+volume for a period. A footprint chart shows all of that
+plus, for every price level the market visited inside the
+bar, exactly how much volume traded as a buyer aggressor
+and how much as a seller aggressor.
 
-The Value Area is the range of prices containing seventy
-percent of the session's total volume. The upper boundary
-is the Value Area High and the lower boundary is the
-Value Area Low. These levels are widely watched by
-professional traders.
+No new data source is needed. Every trade from the Phase 1
+feed has a price, quantity, and side. The footprint engine
+organises these trades into time buckets and price buckets
+simultaneously.
 
-Shade the value area subtly on the volume profile. Render
-the Value Area High and Value Area Low as horizontal
-lines extending across the chart and label them on the
-price axis.
+## How bars are built
 
-### High Volume Nodes and Low Volume Nodes
+Each bar covers a fixed time period. One minute bars are
+the default. Within each bar every price level that saw
+trading gets a cell containing two numbers: sell-initiated
+volume and buy-initiated volume at that price. When the
+period ends the bar is sealed as complete and a new one
+begins. Maintain a rolling history of twenty completed
+bars plus the current forming bar.
 
-Price levels with significantly above-average volume are
-High Volume Nodes. They act as areas of support and
-resistance because they represent prices where the market
-found strong two-sided activity. Render them prominently
-in the volume profile.
+Per bar compute: open price, close price, high price, low
+price, total buy volume, total sell volume, total delta,
+and the point of control which is the price level with the
+highest combined volume in the bar.
 
-Price levels with significantly below-average volume are
-Low Volume Nodes. Price tends to move quickly through
-these areas because there was little agreement at these
-prices. Render them in a subdued color.
+Bars must close on clean clock minute boundaries, not one
+minute after the first trade. Use wall clock time aligned
+to the minute.
+
+## Imbalance signal
+
+When the buy volume at a price level is three times or
+more the sell volume, or vice versa, it is an imbalance.
+Imbalances are visually highlighted because they indicate
+one side overwhelmed the other at a specific price.
+
+## Features
+
+Footprint chart panel showing completed bars side by side
+with the current forming bar on the right. Price levels
+aligned vertically across all bars. Buy-heavy levels in
+green, sell-heavy in red, balanced in neutral. Imbalanced
+levels in a brighter style. Point of control visually
+distinct in each bar.
+
+Bar summary showing total delta and total volume per bar
+at the top or bottom of each column. Positive delta green,
+negative red.
+
+Time labels at the bottom of each completed bar. The
+forming bar shows a countdown to close in seconds.
+
+Keyboard shortcut to toggle the footprint panel on and off.
+The Phase 1 panels remain fully functional regardless.
+
+Volume totals in the footprint must match the delta engine
+totals exactly for the same period. They draw from the
+same raw trades and must agree.
+
+## Build order
+
+Build the footprint engine with unit tests first. Wire it
+into app state alongside the delta engine. Render completed
+bars before worrying about the forming bar animation. Then
+add imbalance highlighting, point of control, countdown,
+and toggle.
+
+## Definition of done
+
+Unit tests pass. Volume totals match delta engine for the
+same periods. Completed bars render correctly. Forming bar
+updates with each trade. Imbalances visually distinct.
+Point of control identifiable. Bar boundaries on clean
+clock minutes. Toggle works. Phase 1 unaffected. Ten
+minutes stable.
 
 ---
 
-## MOMENTUM INDICATORS
+---
 
-Render a separate sub-panel below the volume histogram
-for momentum indicators. The user toggles which indicator
-is shown in this panel.
+# PHASE 3 — Advanced Candlestick Chart
 
-### Relative Strength Index
+## What gets built
 
-RSI measures the speed and magnitude of recent price
-changes on a scale from zero to one hundred. Values above
-seventy indicate overbought conditions. Values below
-thirty indicate oversold conditions.
+A professional-grade candlestick chart with order flow
+overlays, volume analysis, technical indicators, and
+a volume profile. All data comes from what the application
+already has — no new data source required.
 
-Render RSI as a line chart in the indicator panel with
-horizontal reference lines at thirty and seventy. Color
-the line red when above seventy and green when below
-thirty, neutral otherwise.
+## Terminal rendering
 
-Compute RSI correctly using Wilder's smoothing method
-with a default period of fourteen.
+Use Unicode half-block characters to double vertical
+resolution. Half-block characters divide each cell into
+a top and bottom half independently colored. Use braille
+characters for smooth line overlays where straight
+character lines would look too coarse.
 
-### Delta Momentum Oscillator
+## Candle construction
 
-This is a Tapeworm-specific indicator not found in
-standard charting tools. It measures the rate of change
-of cumulative delta rather than price. A rising delta
-momentum line means buying pressure is accelerating. A
-falling line means selling pressure is accelerating.
+All candles come from the footprint engine's per-bar data.
+The current forming candle updates on every trade.
 
-When delta momentum diverges from price momentum the
-signal is particularly significant. A price making new
-highs with falling delta momentum suggests the move is
-weakening. Detect and mark these divergences on the
-oscillator panel.
+Support five timeframes switchable by keyboard: one minute,
+three minutes, five minutes, fifteen minutes, and one hour.
+Switching timeframe reconstructs history by re-aggregating
+stored one-minute bars instantly without losing data.
 
-### MACD
+## Three candle types
 
-The Moving Average Convergence Divergence indicator
-shows the relationship between two EMAs. Render the MACD
-line, signal line, and histogram in the indicator panel.
-The histogram bars are green when MACD is above the
-signal line and red when below.
+Standard candles colored by price direction. Bullish close
+above open is green, bearish is red, doji is neutral.
 
-Use standard default values of twelve, twenty-six, and
-nine periods.
+Heikin Ashi candles smoothed to filter noise. Each candle's
+open is the average of the previous candle's open and close.
+Its close is the average of its own open, high, low, close.
+Never use Heikin Ashi values as inputs to any indicator.
+Indicators always compute from actual market prices.
+
+Delta candles colored by delta direction rather than price.
+Positive delta is green regardless of price direction.
+Negative delta is red regardless of price direction. This
+reveals divergences between price and order flow.
+
+## Volume visualization
+
+Standard volume bars below the candle area proportional
+to the maximum visible bar. Colored to match their candle.
+
+Delta split stacked bars as an alternative mode. Buy volume
+grows from the bottom in green, sell volume grows from the
+top in red within the same bar height.
+
+Volume moving average line overlay on the histogram.
+Bars significantly above average are highlighted.
+
+## Price overlays
+
+Session VWAP as a continuous line updating in real time.
+Compute using typical price (high plus low plus close
+divided by three) multiplied by volume, running sum divided
+by running total volume. VWAP resets at session open.
+
+One and two standard deviation bands above and below VWAP.
+First band subtly shaded. Second band as a prominent line.
+
+Three configurable EMA lines defaulting to nine, twenty-one,
+and fifty periods. Rendered using braille dots for smoothness.
+Each toggleable independently. Labels at current values on
+the right axis.
+
+Cumulative delta line overlaid on candles with a secondary
+axis on the left. Auto-detect and mark bearish divergence
+(price new high but delta not) and bullish divergence
+(price new low but delta not).
+
+## Volume profile
+
+Horizontal histogram on the right side showing volume at
+each price level across the visible session.
+
+Point of control is the highest volume level. Render as a
+distinct horizontal line across the full chart with a label.
+
+Value area contains seventy percent of session volume.
+Shade it in the profile. Render Value Area High and Value
+Area Low as horizontal lines with axis labels.
+
+High volume nodes are significantly above average volume
+levels. Prominent in the profile. Low volume nodes are
+significantly below average. Subdued color.
+
+## Momentum indicators
+
+A sub-panel below the volume histogram toggled by keyboard.
+
+RSI using Wilder's smoothing with a default period of
+fourteen. Reference lines at thirty and seventy. Red above
+seventy, green below thirty. Show a waiting indicator until
+fourteen complete bars exist.
+
+Delta momentum oscillator measuring rate of change of
+cumulative delta. Rising means buying pressure is
+accelerating. Falling means selling is accelerating.
+Detect and mark divergences from price momentum.
+
+MACD with standard twelve, twenty-six, nine defaults.
+MACD line, signal line, and histogram. Histogram green
+above signal, red below.
+
+## Navigation and interaction
+
+Price axis on the right with adaptive labels. Current price
+highlighted with a dotted horizontal line across the chart.
+Time axis at the bottom with session boundary markers.
+Subtle grid at labeled price and time positions.
+
+Crosshair navigation with arrow keys. Full horizontal and
+vertical lines at cursor position. Data panel showing all
+values for the selected candle, positioned to not obscure
+the candles being examined.
+
+Alert levels placed by keyboard shortcut at the current
+crosshair price. Rendered as dashed horizontal lines with
+price labels. Flash status bar on cross. Removable by
+keyboard.
+
+Keyboard toggles for: timeframe, candle type, volume mode,
+indicator panel, each EMA line, VWAP, volume profile,
+delta overlay, scroll, alert placement, and layout mode.
+
+## Layout
+
+Candle chart occupies the lower portion. Phase 1 panels
+remain at the top. Footprint and candle chart share the
+lower portion, toggled by keyboard. A mode that shows
+both in reduced size when the terminal is tall enough.
+
+## Build order
+
+Extend the candle engine first with all derived values and
+unit tests. Basic rendering with bodies and wicks. Volume
+histogram. VWAP and EMAs. Volume profile. Cumulative delta
+and divergence. Momentum indicators. Crosshair, alerts, and
+full layout integration.
+
+## Definition of done
+
+All unit tests pass. VWAP matches manual calculation. EMA
+and RSI match reference values. All five timeframes work.
+All three candle types correct. Volume profile correctly
+identifies POC and value area. Divergences marked correctly.
+All three indicators render correctly. Crosshair and alerts
+work. Terminal resize handled cleanly. Phase 1 and 2
+unaffected. Thirty minutes stable with all overlays active.
 
 ---
 
-## PRICE AXIS AND GRID
+---
 
-The price axis on the right shows price labels at
-meaningful intervals that adapt to the current visible
-price range. Labels always fall on round numbers
-appropriate for the instrument.
+# PHASE 4 — Advanced Order Flow Signals
 
-The current last trade price is highlighted on the axis
-and shown with a dotted horizontal line extending across
-the entire chart.
+## What gets built
 
-Render a subtle grid of horizontal lines at each labeled
-price level and vertical lines at each labeled time
-position. The grid uses a subdued color that does not
-visually compete with the candles and overlays.
+A signals engine that detects five advanced order flow
+patterns in real time and annotates existing panels with
+alerts. No new data source required.
+
+## Signal 1 — Iceberg detection
+
+A large participant hides their full order size by placing
+a small visible order that refreshes repeatedly as it fills.
+The price level keeps trading but does not disappear.
+
+Detect by tracking the ratio of total volume traded at a
+price level to the maximum visible quantity at that level.
+When this ratio exceeds a significant threshold the level
+has traded far more than its visible size suggested.
+Confirmation signals: price holds despite repeated
+aggression, refresh timing is consistent, refresh quantity
+is consistent.
+
+Surface by highlighting the level in the DOM with a
+distinct color, adding to the signals log, annotating
+the footprint chart, and marking the candle chart.
+
+## Signal 2 — Absorption detection
+
+Aggressive orders on one side are consumed by large
+passive orders on the other side without price moving.
+Sell aggression hits the bid but price does not fall.
+
+Detect by correlating the trade feed with order book
+changes. When sell-initiated trades repeatedly hit the
+same bid level and that level does not disappear,
+absorption is occurring. Quantify by comparing volume
+of aggressive trades to change in visible quantity.
+
+Distinguish from iceberg: iceberg is a refreshing
+resting order, absorption is a participant actively
+adding size as it is consumed. The order book signature
+differs.
+
+Surface identically to iceberg with a different visual
+indicator and log entry.
+
+## Signal 3 — Pace of tape
+
+Measures trade execution speed relative to session norms.
+Sudden acceleration indicates urgency. Slow tape at key
+levels may indicate quiet accumulation.
+
+Compute a rolling average of trades per second. Compare
+current rate to average. Track buy pace and sell pace
+separately. Acceleration in one side without the other
+is more significant than overall acceleration.
+
+Render a dynamic pace gauge in the tape panel. Fill
+with color intensity proportional to pace relative to
+average. Green for buy acceleration, red for sell, neutral
+for balanced. Flash and log when pace exceeds three times
+the session average.
+
+## Signal 4 — Stop run detection
+
+Price quickly penetrates a key level with high volume then
+immediately reverses. Delta during the run opposes price
+direction — a downward run shows dominant buy delta as
+the large participant absorbs triggered sells.
+
+Detect by monitoring rapid moves through previously
+high-volume or multiply-tested levels, combined with delta
+divergence where delta does not confirm the price direction.
+Reversal must follow within a small number of bars to
+confirm the pattern.
+
+Mark retrospectively on the candle chart after the reversal
+confirms. Log with the level, direction, and divergence score.
+
+## Signal 5 — Exhaustion detection
+
+A trending market where pace is high and price is making
+new extremes but delta is diverging — the dominant side
+is weakening as price extends.
+
+Detect by combining pace, delta, and price into a composite
+signal. Look for pace acceleration at price extremes with
+delta divergence from the prior extreme. High volume at
+the extreme where the aggressive side achieves a
+disproportionately small price move is additional
+confirmation.
+
+Mark on the candle chart at the triggering bar. These are
+high-confidence signals and must be visually more prominent
+than lower-confidence alerts.
+
+## Signal strength scoring
+
+Each detection scores one to five based on how many
+confirmation criteria are met. Score shown in the log
+and visual intensity reflects score on chart annotations.
+
+## Signals log panel
+
+Chronological list of all detected signals this session.
+Most recent at top. Each entry shows time, type, price,
+description, and score. Color coded by type. Filterable
+by signal type via keyboard. Full session history retained.
+
+Selecting a log entry navigates the candle chart and
+footprint chart to that time for review.
+
+## Configuration
+
+Each signal type has adjustable sensitivity thresholds
+accessible via a settings panel. Defaults are conservative.
+Changes take effect immediately without restart.
+
+## Build order
+
+Signals engine foundation and scoring system with unit tests.
+Iceberg detection with unit tests against synthetic sequences.
+Absorption detection distinguishing it from iceberg. Pace
+of tape gauge. Stop run and exhaustion detection. Signals
+log panel and chart annotation. Configuration panel.
+
+## Definition of done
+
+Unit tests correctly identify and reject patterns for all
+signal types. Pace gauge updates correctly. Stop runs appear
+retrospectively after confirmed reversals. Exhaustion at
+correct extremes with delta confirmation. Log shows all
+signals with correct timestamps and scores. Log navigation
+jumps chart to correct time. Filtering works. Configuration
+changes take effect immediately. Phase 1 through 3 unaffected.
+Thirty minutes stable.
 
 ---
 
-## TIME AXIS
+---
 
-The time axis at the bottom shows timestamps at regular
-intervals. The interval adapts to the current timeframe
-so labels are always meaningful and never overlap.
+# PHASE 5 — Simulated Paper Trading
 
-Mark session open and close times with a distinct vertical
-line if they fall within the visible window. The session
-boundary is a significant reference for VWAP and volume
-profile calculations.
+## What gets built
+
+A complete paper trading system using live Binance data for
+realistic fill simulation. No real broker. No real money.
+
+## Simulated fills
+
+Market orders fill immediately walking the book at current
+prices. Each partial fill records price and quantity
+separately giving a realistic average fill price with
+slippage.
+
+Limit orders rest in the simulation and fill when the live
+tape trades through their price. Same price orders fill
+in placement order — first in first out.
+
+Stop orders trigger at the stop price and become market
+orders. If the market gaps through the stop the fill may
+be worse than the stop price. The simulation replicates
+this slippage.
+
+Stop limit orders trigger like stops but become limit
+orders. If the limit is not reached after trigger the
+order does not fill.
+
+## Order lifecycle
+
+Orders move through states: pending on submission, working
+when live, partial fill as fills arrive, filled on
+completion, cancelled by user, rejected on validation
+failure. Every state transition is logged with a timestamp.
+
+Position limits are enforced. Orders that would exceed the
+configured maximum position size are rejected with a clear
+reason.
+
+## Position tracking
+
+Position expressed as signed quantity. Positive is long,
+negative is short, zero is flat. Track average entry price,
+total cost basis, unrealised PnL marked to last trade
+price, and realised PnL from closed portions. Unrealised
+PnL updates on every incoming trade.
+
+## Bracket orders
+
+Three linked orders submitted simultaneously: entry, stop
+loss, and profit target. Entry fills activate both stop
+and target. When one fills the other is automatically
+cancelled — one cancels other. Quantities must match the
+filled portion for partial entries.
+
+The user defines a bracket by entry price, stop ticks, and
+target ticks. Preview shows absolute prices, risk to reward
+ratio, and dollar risk before confirmation.
+
+## Trailing stop
+
+Follows price in the user's favour but never moves against
+them. For a long position trailing by ten ticks the stop
+starts ten ticks below entry and follows each new high.
+On reversal the stop holds at its highest point. Tracks
+the extreme price since entry and adjusts on every trade.
+
+## Simulated account
+
+Configurable starting balance defaulting to ten thousand
+dollars. Balance adjusts with realised PnL. Unrealised PnL
+shown separately. Configurable maximum daily loss limit —
+when breached no new orders can be submitted.
+
+Account panel shows balance, session realised PnL, open
+position unrealised PnL, total exposure, and remaining
+daily loss buffer.
+
+## DOM integration
+
+The Phase 1 DOM gains trading interactivity. Orders placed
+from the DOM appear as highlighted rows at their limit
+price. Working order quantity visible alongside market
+quantity. Cancel individual orders from the DOM by cursor
+and key. One-click flatten closes position and cancels
+all working orders simultaneously.
+
+## Order entry panel
+
+Full panel for complex orders navigated by keyboard. Fields
+for type, side, quantity, price, stop price, and bracket
+attachment. Preview shows estimated fill, bracket levels,
+risk in ticks, risk in dollars, and resulting position.
+Confirm with enter, cancel with escape.
+
+## Slippage tracking
+
+Every fill records intended price versus actual fill price.
+Session slippage totals tracked and displayed in analytics
+so the user can see the real cost of market orders.
+
+## Keyboard controls
+
+Market buy and sell. Flatten. Cancel all. Increase and
+decrease quantity. Open order entry panel. Toggle trading
+mode to prevent accidental orders during analysis.
+
+## Build order
+
+Order model and state machine with unit tests for every
+state transition. Fill simulation engine with unit tests
+against synthetic order books for all order types. Position
+tracker with PnL unit tests. Bracket and trailing stop
+logic. Account and daily loss limit. DOM integration.
+Order entry panel. Full integration and performance
+verification.
+
+## Definition of done
+
+All order state transition tests pass. Fill simulation
+produces correct prices and slippage for all order types.
+PnL correct across complex partial fill sequences. Bracket
+OCO cancellation correct. Trailing stop tracks correctly.
+Daily loss limit prevents orders when breached. DOM shows
+and clears working orders correctly. Flatten closes
+position and cancels orders simultaneously. Trading does
+not degrade chart or feed performance. Phase 1 through 4
+unaffected. Thirty minutes of active simulated trading
+with no memory growth.
 
 ---
 
-## CROSSHAIR AND DATA PANEL
+---
 
-When the user navigates with arrow keys a crosshair
-follows the selected candle. The crosshair renders as
-a full horizontal line at the cursor price and a full
-vertical line at the cursor time, both in a high-contrast
-color.
+# PHASE 6 — Session Analytics
 
-A data panel appears showing all values for the selected
-candle: open, high, low, close, volume, buy volume, sell
-volume, delta, VWAP at that time, all active EMA values,
-RSI value, and timestamp.
+## What gets built
 
-The data panel is positioned to never obscure the candles
-being examined. If the crosshair is in the right half of
-the chart the panel appears on the left and vice versa.
+An analytics system that processes the Phase 5 trade
+history and produces performance statistics, behavioural
+insights, and interactive charts — all within the terminal.
+
+## Outcome metrics
+
+Win rate computed separately for long and short trades.
+Average winner and average loser in ticks and dollars.
+Profit factor as gross profit divided by gross loss.
+Expectancy as win rate times average winner minus loss
+rate times average loser — the single most important
+number for any trader to understand their edge.
+
+Maximum drawdown as the largest peak to trough decline
+in the cumulative PnL curve. Largest winner and largest
+loser. Longest winning and losing streaks.
+
+Return on risk as total PnL divided by maximum risk
+per trade. Average risk to reward achieved comparing
+actual exit to originally intended target and stop.
+
+## Timing metrics
+
+Time of day analysis grouping trades by entry hour.
+Win rate, average PnL, and count per hour rendered
+as a bar chart. Reveals when the user's edge is
+strongest.
+
+Trade duration analysis tracking hold times from
+entry to exit. Distribution of hold times revealing
+whether the user holds winners shorter than losers —
+one of the most common and damaging trading behaviours.
+
+Entry timing within the candle: early, mid, or late
+in the bar. Performance statistics by timing group.
+
+## Behavioural metrics
+
+Stop adjustment tracking. Every post-entry stop
+movement recorded as widening or tightening. Win rate
+for widened stops computed separately. This is the
+most important behavioural metric — widening stops
+after entry is a sign of poor discipline.
+
+Target adjustment tracking. Ratio of early exits to
+target hits. Average ticks left on the table for
+early exits. Quantifies how much profit poor exit
+discipline costs.
+
+Overtrading detection. Trade frequency per hour
+plotted against cumulative PnL versus trade number.
+Reveals degradation in performance as a session
+progresses.
+
+Revenge trading detection. Entries within a short
+window after a loss that exceed typical entry spacing
+are flagged as potential revenge trades. Win rate
+computed separately for flagged trades.
+
+## Market context metrics
+
+VWAP context grouping trades by whether entry was
+above, at, or below VWAP. Win rate and average PnL
+per group.
+
+Delta context grouping trades by whether entry
+aligned with or opposed the dominant delta direction.
+
+Signal context grouping trades by which Phase 4
+signals were active at entry. Performance per signal
+type reveals whether signal-based entries outperform
+entries with no signals present.
+
+Volatility context grouping trades by pace of tape
+and spread at entry time.
+
+## Cumulative PnL chart
+
+Running cumulative PnL as a line chart across all
+trades. Zero line overlay. Maximum drawdown shaded
+between peak and trough. Selecting a point navigates
+the candle chart to that trade.
+
+## Trade log
+
+Complete chronological log of every trade. Columns
+for all trade data plus behavioural flags. Sortable
+by any column. Selecting a trade navigates the candle
+chart to entry time.
+
+## Summary dashboard
+
+Single screen showing all key metrics. Four sections:
+performance summary, timing analysis, behavioural
+summary, and market context summary. Uses full
+terminal space for maximum information density.
+
+## Navigation
+
+Analytics view replaces the live trading panels.
+Toggle in and out with one keyboard shortcut. Navigate
+between analytics sections with arrow keys or dedicated
+shortcuts.
+
+## Build order
+
+Analytics engine with unit tests for all metric
+calculations against known trade sequences with
+manually computed expected values. Timing metrics.
+Behavioural metrics using order history from Phase 5.
+Market context metrics. PnL chart and trade log
+rendering. Summary dashboard. View switching.
+
+## Definition of done
+
+All metric calculation tests pass with correct values.
+Win rate, profit factor, and expectancy correct against
+manual computation. Hold time distribution correctly
+identifies losers held longer than winners. Stop
+widening correctly flagged and win rate computed
+separately. Overtrading pattern visible when present.
+Revenge trade candidates correctly flagged. All context
+groupings correct. PnL chart navigation works. Trade log
+sort works. Summary dashboard correct. View switching
+clean. Phase 1 through 5 unaffected.
 
 ---
 
-## ALERT LEVELS
+---
 
-The user can set horizontal price alert levels using a
-keyboard shortcut. When the current price crosses an
-alert level the status bar flashes and the level is
-highlighted on the chart.
+# PHASE 7 — Multi-Symbol View
 
-Alert levels persist until manually removed. They render
-as dashed horizontal lines across the chart with a small
-label showing the price.
+## What gets built
+
+The ability to monitor up to eight symbols simultaneously
+with a watchlist, correlation analysis, and relative
+strength view.
+
+## Architectural change
+
+Phase 7 makes symbol a first-class dimension. The
+architecture shifts from one feed and one set of engines
+to a feed manager running multiple feeds and an engine
+registry holding one instance of every engine per symbol.
+
+The engines themselves do not change. What changes is
+that there are now N instances running concurrently. All
+existing panels continue to show data for the currently
+selected active symbol. Switching the active symbol
+instantly updates all panels. No reconnection delay —
+all engines have been running continuously.
+
+This refactor must be done carefully. Verify that single
+symbol behaviour is completely identical to Phase 6
+before adding multi-symbol support.
+
+## Feed manager
+
+Coordinates multiple WebSocket connections. Packs symbol
+subscriptions efficiently onto as few connections as
+possible respecting Binance's per-connection stream limit.
+Handles connection lifecycle per symbol independently.
+A symbol can be live, connecting, or stale independent
+of all other symbols.
+
+## Symbol registry
+
+One complete engine set per symbol. Instantiated when
+the user adds a symbol, destroyed when removed. Stores
+a current state summary per symbol for watchlist display:
+last price, spread, session delta, session volume,
+dominant side, active signal count, connection status.
+
+## Watchlist panel
+
+One row per symbol showing: symbol name, last price,
+price change from session open, spread in ticks, delta
+direction and magnitude, session volume, active signal
+count badge, and an inline sparkline.
+
+The sparkline is a miniature price chart using braille
+characters spanning approximately twenty characters wide.
+Shows the last thirty minutes of one-minute closes scaled
+to fit in one character row. Gives instant directional
+and volatility context for every symbol at a glance.
+
+Rows color coded by delta direction. Active signal count
+badge draws the eye to symbols needing attention.
+
+Navigate with arrow keys. Enter selects the active symbol
+and updates all analysis panels instantly.
+
+## Correlation view
+
+Price correlation matrix showing rolling twenty-minute
+correlation between every pair of monitored symbols.
+Deep red for strong negative, deep green for strong
+positive, neutral for zero. Rows and columns labeled
+with symbol names.
+
+Delta correlation matrix — same structure but using
+delta rather than price. Price-correlated but
+delta-divergent pairs are significant signals.
+
+Lead-lag analysis computing which symbols tend to move
+before others. The lag at maximum cross-correlation is
+shown as a signed number of seconds per pair.
+
+## Relative strength view
+
+All monitored symbols on one chart normalised to zero
+at session open and expressed as percentage change.
+Each symbol a distinct colored line. Labels at the
+right edge with symbol name and current percentage.
+Most recently touched line renders on top.
+
+## Symbol management
+
+Symbol search panel for adding symbols. Up to eight
+simultaneously — ninth attempt rejected with a clear
+message. Remove by navigating to a watchlist row and
+pressing delete, with a confirmation prompt. Reorder
+by selecting and moving up or down with keyboard.
+
+## Performance requirements
+
+Adding symbols must not degrade existing symbol
+processing. Non-active symbol engines update state
+but do not trigger UI redraws. Watchlist updates for
+all symbols at approximately two per second. UI
+maintains sixty frames per second regardless of symbol
+count. No shared mutable state between symbol engines.
+Memory scales linearly with symbol count.
+
+## Build order
+
+Refactor engine registry to be symbol-aware and verify
+single symbol works identically. Feed manager for
+multiple symbols with unit tests for event routing.
+Watchlist panel with two symbols active. Active symbol
+switching with all panels updating correctly. Correlation
+and lead-lag with unit tests. Relative strength view.
+Symbol management. Performance validation with eight
+symbols for thirty minutes.
+
+## Definition of done
+
+Single-symbol behaviour identical to Phase 6 after
+refactor. Eight symbols run simultaneously with
+independent feeds and engines. Watchlist renders correct
+summaries and updates twice per second. Sparklines
+correct. Active symbol switch instantaneous. Correlation
+matrix values correct against manual reference. Lead-lag
+correctly identifies known leading symbol in synthetic
+series. Relative strength normalised correctly. Symbol
+add, remove, and reorder work. Eight symbol limit
+enforced. Memory less than eight times single-symbol
+usage plus reasonable overhead. Sixty fps maintained
+with eight active symbols. Phase 1 through 6 unaffected.
+Thirty minutes stable with eight symbols.
 
 ---
 
-## KEYBOARD CONTROLS
-
-All controls from Phases 1 and 2 remain unchanged.
-
-New controls for the chart panel:
-
-Timeframe selection — one key per timeframe to switch
-between one minute, three minute, five minute, fifteen
-minute, and one hour bars.
-
-Candle type cycling — one key to cycle through standard,
-Heikin Ashi, and delta candle modes.
-
-Volume mode toggle — one key to toggle between standard
-volume bars and delta-split stacked volume bars.
-
-Indicator panel cycling — one key to cycle through RSI,
-delta momentum oscillator, and MACD in the indicator panel.
-
-EMA toggles — individual keys to show and hide each of
-the three EMA lines independently.
-
-VWAP toggle — one key to show and hide VWAP and its bands.
-
-Volume profile toggle — one key to show and hide the
-volume profile on the right side of the chart.
-
-Cumulative delta overlay toggle — one key to show and
-hide the cumulative delta line and secondary axis.
-
-Scroll left and right — arrow keys to pan through candle
-history. Home key to return to the live edge.
-
-Alert level placement — one key to place an alert at
-the current crosshair price. Delete key to remove the
-nearest alert level.
-
 ---
 
-## LAYOUT
+# OVERALL DEFINITION OF DONE
 
-The chart occupies the lower portion of the terminal.
-The Phase 1 panels remain at the top. The footprint chart
-from Phase 2 and the candle chart from Phase 3 share the
-lower portion, toggled by a keyboard shortcut.
+Tapeworm is complete when all seven phases have passed
+their individual definitions of done and the following
+hold simultaneously:
 
-Within the candle chart area the vertical space is divided
-as follows. The majority of the height goes to the candle
-and overlay area. Below that is the volume histogram
-including the delta stack view. Below that is the momentum
-indicator sub-panel. The volume profile occupies a fixed
-width column on the right side of the candle area only.
-The price axis is on the right edge. The time axis is at
-the bottom of the candle area.
+All unit tests across all phases pass with zero failures.
 
-All sub-panels resize proportionally when the terminal
-is resized. The chart must handle terminal resize events
-cleanly without corrupting the display.
+The application connects to Binance, populates all panels,
+and is fully interactive within five seconds of launch.
 
----
+All seven phases of functionality operate correctly and
+concurrently without any phase interfering with another.
 
-## CORRECTNESS REQUIREMENTS
+Eight symbols can be monitored simultaneously with all
+overlays, signals, and paper trading active.
 
-VWAP must be computed as a running session calculation
-starting from the first trade of the session. Switching
-timeframes must not change the VWAP value because it is
-computed from individual trades, not from candles.
+The application runs stably for one hour under full load
+with no panic, no memory growth, and consistent sixty
+frames per second rendering.
 
-EMA values must be computed using correct exponential
-smoothing. The smoothing factor is two divided by the
-period plus one. The seed value for the first EMA
-calculation uses a simple average of the first period's
-closes.
-
-RSI must use Wilder's smoothing, not simple averages.
-The first RSI value requires at least fourteen complete
-bars. Before that the RSI panel shows a waiting indicator.
-
-Volume profile must recompute whenever the visible window
-changes, whether by scrolling or by timeframe switching.
-The Point of Control, Value Area High, and Value Area Low
-are properties of the visible session data, not global
-constants.
-
-Heikin Ashi values must be computed from actual OHLC data.
-They must never be used as inputs to VWAP, RSI, or any
-other indicator. Indicators always compute from actual
-market prices, not smoothed values.
-
----
-
-## BUILD ORDER
-
-Build in this sequence. Verify each sub-phase before
-proceeding to the next.
-
-Phase 3a — Extend the candle engine to compute all derived
-values per bar: VWAP contribution, EMA inputs, RSI inputs,
-delta momentum. Unit tests must verify all calculations
-against known reference values.
-
-Phase 3b — Basic candle rendering with half-block
-characters. Bodies, wicks, price axis, time axis, grid.
-No overlays yet. Verify visually with live data.
-
-Phase 3c — Volume histogram with delta stack mode and
-volume moving average line.
-
-Phase 3d — VWAP line and standard deviation bands.
-EMA lines using braille dot rendering.
-
-Phase 3e — Volume profile with Point of Control, Value
-Area, High Volume Nodes, and Low Volume Nodes.
-
-Phase 3f — Cumulative delta overlay with secondary axis
-and divergence detection and marking.
-
-Phase 3g — Momentum indicator sub-panel with RSI, delta
-momentum oscillator, and MACD.
-
-Phase 3h — Crosshair with data panel, alert levels,
-Heikin Ashi mode, delta candle mode, keyboard controls,
-and layout integration with Phase 2.
-
----
-
-## OUT OF SCOPE FOR THIS PHASE
-
-Drawing tools for trend lines or channels. Pattern
-recognition or automated trade signals. Exporting chart
-images or data. Mouse interaction. More than five
-timeframes. Tick bars, volume bars, or range bars.
-Connection to any data source other than the existing
-Binance feed. Saving alert levels between sessions.
-
----
-
-## DEFINITION OF DONE
-
-All unit tests for candle construction and indicator
-calculations pass with zero failures.
-
-VWAP values match manual calculation from raw trades.
-
-EMA values match reference values for known input sequences.
-
-RSI values match Wilder's method reference values.
-
-All five timeframes render correctly and switch instantly.
-
-All three candle types render correctly.
-
-Volume profile correctly identifies Point of Control and
-Value Area for the visible session.
-
-Cumulative delta overlay correctly marks divergences.
-
-All three momentum indicators render correctly in the
-indicator sub-panel.
-
-Crosshair navigation and data panel work across the full
-candle history.
-
-Alert levels place and remove correctly and flash on cross.
-
-All keyboard controls work as specified.
-
-Terminal resize is handled cleanly with no display
-corruption.
-
-All Phase 1 and Phase 2 features continue to work without
-any regression.
-
-The application runs stably for thirty minutes with all
-overlays active and no memory growth.
+q exits cleanly and restores the terminal to its exact
+original state regardless of which panels are active.

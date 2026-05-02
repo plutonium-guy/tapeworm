@@ -15,7 +15,7 @@ use time::format_description::FormatItem;
 use time::macros::format_description;
 
 use crate::app::AppState;
-use crate::candle::{CandleBar, TIMEFRAMES_MS, heikin_ashi_series};
+use crate::candle::{AggregatedSeries, CandleBar, TIMEFRAMES_MS, heikin_ashi_series};
 use crate::indicators::{Ema, Macd, Rsi};
 
 const HHMM: &[FormatItem<'_>] = format_description!("[hour]:[minute]");
@@ -243,7 +243,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState) {
         return;
     }
 
-    let series = app.candles.aggregate(view.timeframe_ms);
+    let series = app.active.candles.aggregate(view.timeframe_ms);
     if series.is_empty() {
         let p = Paragraph::new("waiting for first trade…").style(Style::default().fg(Color::DarkGray));
         frame.render_widget(p, inner);
@@ -295,13 +295,18 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState) {
         return;
     }
 
+    // Compute indicator series over the FULL aggregated history so that
+    // displayed values are stable as the user scrolls. Slicing happens in
+    // the draw_* functions below.
+    let full_indicators = compute_full_indicators(&series);
+
     // Candle rendering colors are computed against a transformed series:
     // Heikin Ashi or Delta retain the same OHLC view but recolor differently.
     let display_bars: DisplayBars = make_display_bars(&bars, view.candle_type);
 
     // Vertical price range across visible bars + volume max.
     let (mut p_lo, mut p_hi) = price_range(&display_bars);
-    if let Some(vwap) = app.candles.session_vwap() {
+    if let Some(vwap) = app.active.candles.session_vwap() {
         if view.show_vwap {
             p_hi = p_hi.max(vwap);
             p_lo = p_lo.min(vwap);
@@ -315,16 +320,75 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState) {
     let p_hi = p_hi + pad;
     let p_lo = (p_lo - pad).max(0.0);
 
-    draw_candle_area(frame, candle_area, &display_bars, view, app, p_lo, p_hi);
-    draw_price_axis(frame, axis_area, p_lo, p_hi, app.candles.session_vwap(), view);
+    draw_candle_area(
+        frame,
+        candle_area,
+        &display_bars,
+        view,
+        app,
+        p_lo,
+        p_hi,
+        &full_indicators,
+        start_idx,
+    );
+    draw_price_axis(frame, axis_area, p_lo, p_hi, app.active.candles.session_vwap(), view);
     if view.show_volume_profile {
         draw_volume_profile(frame, profile_area, &bars, p_lo, p_hi);
     }
-    draw_volume(frame, volume_area, &bars, view);
+    draw_volume(frame, volume_area, &bars, view, &full_indicators, start_idx);
     if view.show_indicator_panel {
-        draw_indicator(frame, indicator_area, &bars, view);
+        draw_indicator(frame, indicator_area, &bars, view, &full_indicators, start_idx);
     }
     draw_time_axis(frame, time_axis_area, &bars);
+}
+
+/// Indicator series computed over the entire aggregated history. Slicing
+/// happens at the draw site; this avoids the bug where each draw call
+/// re-seeded EMA/RSI/MACD on the visible window only and produced
+/// scroll-dependent values.
+struct FullIndicators {
+    ema9: Vec<Option<f64>>,
+    ema21: Vec<Option<f64>>,
+    ema50: Vec<Option<f64>>,
+    rsi14: Vec<Option<f64>>,
+    macd_hist: Vec<Option<f64>>,
+    /// 20-bar SMA of total volume — computed once over the full series so
+    /// the left edge of the volume panel doesn't show distorted (short-window)
+    /// averages when the user scrolls.
+    vol_sma20: Vec<f64>,
+}
+
+fn compute_full_indicators(series: &AggregatedSeries) -> FullIndicators {
+    let mut e9 = Ema::new(9);
+    let mut e21 = Ema::new(21);
+    let mut e50 = Ema::new(50);
+    let mut rsi = Rsi::new(14);
+    let mut macd = Macd::new(12, 26, 9);
+    let mut ema9 = Vec::with_capacity(series.len());
+    let mut ema21 = Vec::with_capacity(series.len());
+    let mut ema50 = Vec::with_capacity(series.len());
+    let mut rsi14 = Vec::with_capacity(series.len());
+    let mut macd_hist = Vec::with_capacity(series.len());
+    let mut vols: Vec<f64> = Vec::with_capacity(series.len());
+    for bar in series.iter() {
+        let c = bar.close;
+        ema9.push(e9.update(c));
+        ema21.push(e21.update(c));
+        ema50.push(e50.update(c));
+        rsi14.push(rsi.update(c));
+        macd_hist.push(macd.update(c).map(|v| v.histogram));
+        vols.push(bar.total_volume());
+    }
+    // 20-bar trailing SMA of volume — true rolling window; the left edge
+    // of the visible window inherits the correct historical average.
+    let vol_sma20: Vec<f64> = (0..vols.len())
+        .map(|i| {
+            let lo = i.saturating_sub(19);
+            let slice = &vols[lo..=i];
+            slice.iter().sum::<f64>() / slice.len() as f64
+        })
+        .collect();
+    FullIndicators { ema9, ema21, ema50, rsi14, macd_hist, vol_sma20 }
 }
 
 #[derive(Debug, Clone)]
@@ -419,6 +483,8 @@ fn draw_candle_area(
     app: &AppState,
     p_lo: f64,
     p_hi: f64,
+    indicators: &FullIndicators,
+    start_idx: usize,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -498,14 +564,14 @@ fn draw_candle_area(
 
     // VWAP overlay.
     if view.show_vwap {
-        if let Some(vwap) = app.candles.session_vwap() {
+        if let Some(vwap) = app.active.candles.session_vwap() {
             if let Some(r) = price_to_row(vwap) {
                 for c in 0..w {
                     grid[r][c] = ('─', Style::default().fg(Color::Magenta));
                 }
             }
             // Std-dev bands.
-            if let Some(sd) = app.candles.session_vwap_stddev() {
+            if let Some(sd) = app.active.candles.session_vwap_stddev() {
                 for (k, ch) in [(1.0_f64, '╌'), (2.0_f64, '╍')] {
                     for sign in [1.0_f64, -1.0] {
                         if let Some(r) = price_to_row(vwap + sign * k * sd) {
@@ -521,39 +587,43 @@ fn draw_candle_area(
         }
     }
 
-    // EMA overlays computed on close prices of display bars (= raw OHLC).
-    let close_series: Vec<f64> = bars.iter().map(|b| b.real_close).collect();
-    let ema_periods = [9usize, 21, 50];
-    let ema_colors = [Color::LightCyan, Color::LightYellow, Color::LightMagenta];
-    for (idx, &period) in ema_periods.iter().enumerate() {
+    // EMA overlays — values were precomputed over the FULL aggregated
+    // series; we just slice the visible window. This makes the displayed
+    // values stable regardless of how the user scrolls the chart.
+    let ema_sources: [(&Vec<Option<f64>>, Color, usize); 3] = [
+        (&indicators.ema9, Color::LightCyan, 0),
+        (&indicators.ema21, Color::LightYellow, 1),
+        (&indicators.ema50, Color::LightMagenta, 2),
+    ];
+    for (ema_series, color, idx) in ema_sources {
         if !view.show_emas[idx] { continue; }
-        let mut ema = Ema::new(period);
         let mut prev_row: Option<usize> = None;
-        for (col, c) in close_series.iter().enumerate().take(visible_bars) {
-            if let Some(v) = ema.update(*c) {
-                if let Some(r) = price_to_row(v) {
-                    let glyph = '·';
-                    grid[r][col] = (glyph, Style::default().fg(ema_colors[idx]));
-                    // Connect simple steps to previous row to give a line feel.
-                    if let Some(pr) = prev_row {
-                        let (lo, hi) = if pr < r { (pr, r) } else { (r, pr) };
-                        for rr in lo..=hi {
-                            if grid[rr][col].0 == ' ' || grid[rr][col].0 == '·' {
-                                grid[rr][col] = ('·', Style::default().fg(ema_colors[idx]));
-                            }
+        for col in 0..visible_bars {
+            let global_idx = start_idx + col;
+            let v = match ema_series.get(global_idx).and_then(|x| *x) {
+                Some(v) => v,
+                None => continue,
+            };
+            if let Some(r) = price_to_row(v) {
+                grid[r][col] = ('·', Style::default().fg(color));
+                if let Some(pr) = prev_row {
+                    let (lo, hi) = if pr < r { (pr, r) } else { (r, pr) };
+                    for rr in lo..=hi {
+                        if grid[rr][col].0 == ' ' || grid[rr][col].0 == '·' {
+                            grid[rr][col] = ('·', Style::default().fg(color));
                         }
                     }
-                    prev_row = Some(r);
                 }
+                prev_row = Some(r);
             }
         }
     }
 
     // Cumulative delta overlay (secondary axis): scale between min/max of cum_delta_trail.
     if view.show_cum_delta {
-        let trail = app.candles.cum_delta_trail();
+        let trail = app.active.candles.cum_delta_trail();
         if !trail.is_empty() {
-            let total_completed = app.candles.completed().len();
+            let total_completed = app.active.candles.completed().len();
             // Map global trail indices to local visible indices.
             let global_start = total_completed.saturating_sub(visible_bars);
             let local: Vec<f64> = trail
@@ -681,9 +751,6 @@ fn data_panel_lines(
     visible: &[DisplayBar],
     cross_col: usize,
 ) -> Vec<String> {
-    let dt = OffsetDateTime::from_unix_timestamp(visible[cross_col].real_close as i64 / 1).unwrap_or(OffsetDateTime::UNIX_EPOCH);
-    let _ = dt;
-
     // Compute EMAs at this cross point from prefix of closes.
     let prefix: Vec<f64> = visible.iter().take(cross_col + 1).map(|b| b.real_close).collect();
     let mut e9 = Ema::new(9);
@@ -699,7 +766,7 @@ fn data_panel_lines(
         rsi.update(*c);
     }
 
-    let vwap = app.candles.session_vwap().unwrap_or(0.0);
+    let vwap = app.active.candles.session_vwap().unwrap_or(0.0);
     let mut lines: Vec<String> = Vec::new();
     lines.push(" Selected ".into());
     lines.push(format!(" O: {:>10.2} ", bar.open));
@@ -707,10 +774,11 @@ fn data_panel_lines(
     lines.push(format!(" L: {:>10.2} ", bar.real_low));
     lines.push(format!(" C: {:>10.2} ", bar.real_close));
     let total_vol: f64 = app
+        .active
         .candles
         .completed()
         .iter()
-        .chain(app.candles.forming().into_iter())
+        .chain(app.active.candles.forming().into_iter())
         .map(|b| b.total_volume())
         .sum();
     let _ = total_vol;
@@ -728,11 +796,16 @@ fn detect_and_mark_divergences(
     bars: &[DisplayBar],
     cum_delta_local: &[f64],
 ) {
-    if bars.len() < 5 || cum_delta_local.len() != bars.len() {
+    // Use the prefix common to both inputs — `bars` typically includes the
+    // forming bar while `cum_delta_local` only carries values for sealed
+    // bars, so an exact-length match almost never holds in the live path.
+    let n = bars.len().min(cum_delta_local.len());
+    if n < 5 {
         return;
     }
+    let bars = &bars[..n];
+    let cum_delta_local = &cum_delta_local[..n];
     // Simple swing-high / swing-low detection over a short lookback.
-    let n = bars.len();
     let look = 3.min(n / 2);
     let h = grid.len();
     if h == 0 { return; }
@@ -818,7 +891,7 @@ fn draw_volume_profile(frame: &mut Frame, area: Rect, bars: &[&CandleBar], p_lo:
         let target = total_vol * 0.7;
         let mut acc = buckets[poc];
         va_set.insert(poc);
-        let (mut up, mut down) = (poc.saturating_sub(1) as i64, (poc + 1) as i64);
+        let (mut up, mut down) = (poc as i64 - 1, poc as i64 + 1);
         while acc < target {
             let up_v = if up >= 0 { buckets[up as usize] } else { -1.0 };
             let dn_v = if (down as usize) < h { buckets[down as usize] } else { -1.0 };
@@ -848,7 +921,14 @@ fn draw_volume_profile(frame: &mut Frame, area: Rect, bars: &[&CandleBar], p_lo:
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn draw_volume(frame: &mut Frame, area: Rect, bars: &[&CandleBar], view: &ChartView) {
+fn draw_volume(
+    frame: &mut Frame,
+    area: Rect,
+    bars: &[&CandleBar],
+    view: &ChartView,
+    indicators: &FullIndicators,
+    start_idx: usize,
+) {
     if area.width == 0 || area.height == 0 { return; }
     let h = area.height as usize;
     let w = area.width as usize;
@@ -857,14 +937,14 @@ fn draw_volume(frame: &mut Frame, area: Rect, bars: &[&CandleBar], view: &ChartV
     // Max for scaling
     let max_v = bars.iter().map(|b| b.total_volume()).fold(0.0_f64, f64::max).max(1e-9);
 
-    // 20-bar moving average
-    let mut sma: Vec<f64> = Vec::with_capacity(visible);
-    for i in 0..visible {
-        let lo = i.saturating_sub(19);
-        let slice = &bars[lo..=i];
-        let avg = slice.iter().map(|b| b.total_volume()).sum::<f64>() / slice.len() as f64;
-        sma.push(avg);
-    }
+    // 20-bar moving average — precomputed over full history; slice here.
+    let sma: Vec<f64> = indicators
+        .vol_sma20
+        .iter()
+        .skip(start_idx)
+        .take(visible)
+        .copied()
+        .collect();
     let mut grid: Vec<Vec<(char, Style)>> = (0..h).map(|_| (0..w).map(|_| (' ', Style::default())).collect()).collect();
     for (col, b) in bars.iter().enumerate().take(visible) {
         let total = b.total_volume();
@@ -879,18 +959,23 @@ fn draw_volume(frame: &mut Frame, area: Rect, bars: &[&CandleBar], view: &ChartV
                 }
             }
             VolumeMode::DeltaStack => {
-                // Stack: sell on top, buy on bottom
+                // Stack: buy fills from the bottom, sell stacks above it.
+                // CRITICAL: clip the sell range to the rows still empty
+                // above buy. Without the clip, when buy_h fills the whole
+                // bar the saturating_sub bottoms out at row 0 and the
+                // sell loop overwrites the bottom buy cells.
                 let buy_h = if total > 0.0 { ((b.buy_volume / max_v) * h as f64).round() as usize } else { 0 };
                 let sell_h = if total > 0.0 { ((b.sell_volume / max_v) * h as f64).round() as usize } else { 0 };
-                for r in 0..buy_h.min(h) {
+                let buy_h = buy_h.min(h);
+                let sell_room = h.saturating_sub(buy_h);
+                let sell_h = sell_h.min(sell_room);
+                for r in 0..buy_h {
                     let row = h - 1 - r;
                     grid[row][col] = ('█', Style::default().fg(Color::Green));
                 }
-                for r in 0..sell_h.min(h) {
-                    let row = (h.saturating_sub(buy_h)).saturating_sub(1 + r);
-                    if row < h {
-                        grid[row][col] = ('█', Style::default().fg(Color::Red));
-                    }
+                for r in 0..sell_h {
+                    let row = sell_room.saturating_sub(1 + r);
+                    grid[row][col] = ('█', Style::default().fg(Color::Red));
                 }
             }
         }
@@ -916,39 +1001,43 @@ fn draw_volume(frame: &mut Frame, area: Rect, bars: &[&CandleBar], view: &ChartV
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn draw_indicator(frame: &mut Frame, area: Rect, bars: &[&CandleBar], view: &ChartView) {
+fn draw_indicator(
+    frame: &mut Frame,
+    area: Rect,
+    bars: &[&CandleBar],
+    view: &ChartView,
+    indicators: &FullIndicators,
+    start_idx: usize,
+) {
     if area.width == 0 || area.height == 0 { return; }
     let h = area.height as usize;
     let w = area.width as usize;
     let visible = bars.len().min(w);
-    let closes: Vec<f64> = bars.iter().map(|b| b.close).collect();
+
+    // Slice the relevant portion of the precomputed full indicator series.
+    let slice_full = |full: &[Option<f64>]| -> Vec<Option<f64>> {
+        full.iter().skip(start_idx).take(visible).copied().collect()
+    };
 
     let (values, lo, hi, color_fn): (Vec<Option<f64>>, f64, f64, Box<dyn Fn(f64) -> Color>) = match view.indicator {
         IndicatorMode::Rsi => {
-            let mut rsi = Rsi::new(14);
-            let vals: Vec<Option<f64>> = closes.iter().map(|c| rsi.update(*c)).collect();
+            let vals = slice_full(&indicators.rsi14);
             let color: Box<dyn Fn(f64) -> Color> = Box::new(|v: f64| {
                 if v >= 70.0 { Color::Red } else if v <= 30.0 { Color::Green } else { Color::Cyan }
             });
             (vals, 0.0, 100.0, color)
         }
         IndicatorMode::Macd => {
-            let mut macd = Macd::new(12, 26, 9);
-            let mut histos: Vec<Option<f64>> = Vec::with_capacity(closes.len());
+            let vals = slice_full(&indicators.macd_hist);
             let mut min_h = 0.0_f64;
             let mut max_h = 0.0_f64;
-            for c in &closes {
-                let v = macd.update(*c);
-                let h = v.map(|m| m.histogram);
-                if let Some(hh) = h {
-                    if hh < min_h { min_h = hh; }
-                    if hh > max_h { max_h = hh; }
-                }
-                histos.push(h);
+            for v in vals.iter().flatten() {
+                if *v < min_h { min_h = *v; }
+                if *v > max_h { max_h = *v; }
             }
             let span = (max_h - min_h).max(1e-9);
             let color: Box<dyn Fn(f64) -> Color> = Box::new(|v: f64| if v >= 0.0 { Color::Green } else { Color::Red });
-            (histos, min_h - span * 0.1, max_h + span * 0.1, color)
+            (vals, min_h - span * 0.1, max_h + span * 0.1, color)
         }
         IndicatorMode::DeltaMomentum => {
             // Delta momentum across visible bars: derive cum delta from bar deltas.
